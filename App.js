@@ -19,13 +19,12 @@ import React, {
 import {
   View,
   Text,
+  TextInput,
   TouchableOpacity,
   StyleSheet,
   Alert,
   StatusBar,
   SafeAreaView,
-  PanResponder,
-  Animated,
   Image,
 } from 'react-native';
 
@@ -97,8 +96,6 @@ const numToDigits = (n) => {
 /** Convert a digit array back to a number (min 1) */
 const digitsToNum = (d) => Math.max(1, d[0] * 1000 + d[1] * 100 + d[2] * 10 + d[3]);
 
-const SLIDER_WIDTH = 280; // px — width of the HV slider track
-
 // ─── Global GM Context ───────────────────────────────────────────────────────
 export const GMContext = createContext(null);
 
@@ -152,12 +149,6 @@ function GMCountingScreen() {
   const [draftDigits, setDraftDigits] = useState([0, 0, 1, 0]);
   const okTimeoutRef = useRef(null);
 
-  // Number-of-readings digit editing (used during PROG_READINGS_ADJUST)
-  const DEFAULT_READINGS = 1;
-  const [numberOfReadings, setNumberOfReadings] = useState(DEFAULT_READINGS);
-  const [readingsCursorPos, setReadingsCursorPos] = useState(0);
-  const [draftReadings, setDraftReadings] = useState(numToDigits(DEFAULT_READINGS));
-
   // Label assignment (used during PROG_LABEL_ASSIGN)
   const [label, setLabel] = useState('SP');
   const [draftLabel, setDraftLabel] = useState('SP');
@@ -209,7 +200,6 @@ function GMCountingScreen() {
     const snapshot = {
       acqMode,
       presetTime,
-      numberOfReadings,
       label,
       iterations,
     };
@@ -218,8 +208,6 @@ function GMCountingScreen() {
     setDraftAcqMode(snapshot.acqMode);
     setDraftDigits(numToDigits(snapshot.presetTime));
     setCursorPos(0);
-    setDraftReadings(numToDigits(snapshot.numberOfReadings));
-    setReadingsCursorPos(0);
     setDraftLabel(snapshot.label);
     setDraftIterations(snapshot.iterations);
   };
@@ -230,13 +218,11 @@ function GMCountingScreen() {
     if (snapshot) {
       setDraftAcqMode(snapshot.acqMode);
       setDraftDigits(numToDigits(snapshot.presetTime));
-      setDraftReadings(numToDigits(snapshot.numberOfReadings));
       setDraftLabel(snapshot.label);
       setDraftIterations(snapshot.iterations);
     }
 
     setCursorPos(0);
-    setReadingsCursorPos(0);
     setActiveParamField(PARAM_FIELD_TIMER);  // Reset to default parameter
     programSessionRef.current = null;
     setProgSub(PROG_OFF);
@@ -244,11 +230,9 @@ function GMCountingScreen() {
 
   const commitProgrammingSession = () => {
     const nextPresetTime = digitsToNum(draftDigits);
-    const nextNumberOfReadings = digitsToNum(draftReadings);
 
     setAcqMode(draftAcqMode);
     setPresetTime(nextPresetTime);
-    setNumberOfReadings(nextNumberOfReadings);
     setLabel(draftLabel);
     setIterations(draftIterations);
     setActiveParamField(PARAM_FIELD_TIMER);  // Reset to default parameter
@@ -297,7 +281,7 @@ function GMCountingScreen() {
       value,
       acqMode,
       presetTime,
-      numberOfReadings,
+      numberOfReadings: storedReadings.length,
       label,
       iterations,
       hv,
@@ -416,7 +400,6 @@ function GMCountingScreen() {
     presetTime,
     iterations,
     iterationRestartToken,
-    numberOfReadings,
     label,
     hv,
     storeDataMode,
@@ -445,7 +428,6 @@ function GMCountingScreen() {
 
     // From TIME_ADJUST, cycle to READINGS_ADJUST
     if (progSub === PROG_TIME_ADJUST) {
-      setReadingsCursorPos(0);
       setProgSub(PROG_READINGS_ADJUST);
       setActiveParamField(PARAM_FIELD_READINGS);
       return;
@@ -529,12 +511,8 @@ function GMCountingScreen() {
       });
 
     } else if (progSub === PROG_READINGS_ADJUST) {
-      // ▲ → increment digit at readingsCursorPos (0–9 wrap)
-      setDraftReadings((prev) => {
-        const next = [...prev];
-        next[readingsCursorPos] = (next[readingsCursorPos] + 1) % 10;
-        return next;
-      });
+      // READINGS is immutable and reflects current MEM count.
+      return;
 
     } else if (progSub === PROG_LABEL_ASSIGN) {
       // ▲ → cycle label forward SP → ST → BG → SP
@@ -597,8 +575,8 @@ function GMCountingScreen() {
       setCursorPos((pos) => (pos === 0 ? 3 : pos - 1));
 
     } else if (progSub === PROG_READINGS_ADJUST) {
-      // ▼ → move readings cursor one position to the LEFT (wraps 0 → 3)
-      setReadingsCursorPos((pos) => (pos === 0 ? 3 : pos - 1));
+      // READINGS is immutable and reflects current MEM count.
+      return;
 
     } else if (progSub === PROG_LABEL_ASSIGN) {
       // ▼ → cycle label backward SP ← BG ← ST ← SP
@@ -702,7 +680,7 @@ function GMCountingScreen() {
   const currentRecallEntry = recallIndex >= 0 ? storedReadings[recallIndex] : null;
   const displayAcqMode = isProgOn ? draftAcqMode : acqMode;
   const draftPresetTime = digitsToNum(draftDigits);
-  const draftNumberOfReadings = digitsToNum(draftReadings);
+  const draftNumberOfReadings = memoryCount;
 
   const formatCounts = (n) => String(n).padStart(6, '0');
   const formatPRTime = (n) => String(n).padStart(4, '0');
@@ -718,7 +696,7 @@ function GMCountingScreen() {
     : dataMode === DATA_MESSAGE ? dataMessage
     : progSub === PROG_ACQ_SELECT        ? '▲ / ▼  →  Select ACQ Mode'
     : progSub === PROG_TIME_ADJUST     ? '▲ → Increment digit  ·  ▼ → Move cursor left  (Preset Time)'
-    : progSub === PROG_READINGS_ADJUST ? '▲ → Increment digit  ·  ▼ → Move cursor left  (No. of Readings)'
+    : progSub === PROG_READINGS_ADJUST ? 'READINGS shows total MEM count (read-only)'
     : progSub === PROG_LABEL_ASSIGN    ? '▲ / ▼  →  Cycle label  [SP · ST · BG]'
     : progSub === PROG_ITERATION_ADJUST ? '▲/▼ set iterations (1-9)'
     : progSub === PROG_HV_ADJUST ? `▲/▼ adjust HV by ${hvStep} V step`
@@ -882,26 +860,14 @@ function GMCountingScreen() {
                 <Text style={styles.progEditHeader}>READINGS IN</Text>
                 <View style={styles.progEditRow}>
                   <Text style={styles.progEditLabel}>REAIN</Text>
-                  <View style={styles.digitRow}>
-                    {draftReadings.map((digit, idx) => (
-                      <View key={idx} style={styles.digitCell}>
-                        <Text style={[
-                          styles.cursorArrow,
-                          idx === readingsCursorPos ? styles.cursorArrowActive : styles.cursorArrowHidden,
-                        ]}>▲</Text>
-                        <Text style={[
-                          styles.digitChar,
-                          idx === readingsCursorPos && styles.digitCharActive,
-                        ]}>{digit}</Text>
-                      </View>
-                    ))}
-                  </View>
+                  <Text style={styles.progEditHv}>{formatPRTime(memoryCount)}</Text>
                 </View>
                 <View style={styles.progEditRow}>
                   <Text style={styles.progEditLabel}>HV   </Text>
                   <Text style={styles.progEditHv}>{formatHV(hv)}</Text>
                   <Text style={styles.displayUnit}> V</Text>
                 </View>
+                <Text style={styles.overlaySub}>MEM count is read-only</Text>
               </View>
             )}
 
@@ -1023,20 +989,7 @@ function GMCountingScreen() {
                     <Text style={styles.progEditHeader}>READINGS IN</Text>
                     <View style={styles.progEditRow}>
                       <Text style={styles.progEditLabel}>REAIN</Text>
-                      <View style={styles.digitRow}>
-                        {draftReadings.map((digit, idx) => (
-                          <View key={idx} style={styles.digitCell}>
-                            <Text style={[
-                              styles.cursorArrow,
-                              idx === readingsCursorPos ? styles.cursorArrowActive : styles.cursorArrowHidden,
-                            ]}>▲</Text>
-                            <Text style={[
-                              styles.digitChar,
-                              idx === readingsCursorPos && styles.digitCharActive,
-                            ]}>{digit}</Text>
-                          </View>
-                        ))}
-                      </View>
+                      <Text style={styles.progEditHv}>{formatPRTime(memoryCount)}</Text>
                     </View>
                   </View>
                 )}
@@ -1115,9 +1068,9 @@ function GMCountingScreen() {
 
                 {progSub === PROG_OFF && activeParamField === PARAM_FIELD_READINGS && (
                   <View style={styles.displayRow}>
-                    <Text style={styles.displayLabel}>READIN :</Text>
+                    <Text style={styles.displayLabel}>MEM :</Text>
                     <Text style={styles.displayValue}>
-                      {formatPRTime(numberOfReadings)}
+                      {formatPRTime(memoryCount)}
                     </Text>
                   </View>
                 )}
@@ -1250,49 +1203,29 @@ function GMCountingScreen() {
  * Drag left   → decrease HV (counter-clockwise)
  */
 function HVSlider({ hv, setHv, disabled, hvStep, setHvStep }) {
-  const thumbX = useRef(new Animated.Value(hvToX(hv))).current;
-  const dragStartHvRef = useRef(hv);
+  const [hvInput, setHvInput] = useState(String(hv));
 
-  // Keep thumb in sync when hv changes via ▲/▼ buttons
   useEffect(() => {
-    thumbX.setValue(hvToX(hv));
-    dragStartHvRef.current = hv;
+    setHvInput(String(hv));
   }, [hv]);
 
-  function hvToX(v) {
-    return ((v - HV_MIN) / (HV_MAX - HV_MIN)) * SLIDER_WIDTH;
-  }
+  const clampHv = (value) => Math.max(HV_MIN, Math.min(HV_MAX, value));
 
-  const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => !disabled,
-      onMoveShouldSetPanResponder: () => !disabled,
-      onPanResponderGrant: () => {
-        dragStartHvRef.current = hv;
-      },
-      onPanResponderMove: (_, gestureState) => {
-        // Quantize drag into deliberate movement buckets to avoid oversensitive updates.
-        const PX_PER_STEP = 18;
-        const dragSteps = Math.round(gestureState.dx / PX_PER_STEP);
-        const nextHv = Math.max(
-          HV_MIN,
-          Math.min(HV_MAX, dragStartHvRef.current + dragSteps * hvStep)
-        );
-        setHv(nextHv);
-        thumbX.setValue(hvToX(nextHv));
-      },
-      onPanResponderRelease: () => {
-        // Snap thumb to the nearest hvStep boundary
-        setHv((v) => {
-          const snapped = Math.round(v / hvStep) * hvStep;
-          thumbX.setValue(hvToX(snapped));
-          return snapped;
-        });
-      },
-    })
-  ).current;
+  const applyHvInput = () => {
+    const parsed = Number.parseInt(hvInput, 10);
+    if (Number.isNaN(parsed)) {
+      setHvInput(String(hv));
+      return;
+    }
+    const next = clampHv(parsed);
+    setHv(next);
+    setHvInput(String(next));
+  };
 
-  const pct = ((hv - HV_MIN) / (HV_MAX - HV_MIN)) * 100;
+  const jumpHv = (delta) => {
+    if (disabled) return;
+    setHv((v) => clampHv(v + delta));
+  };
 
   return (
     <View style={styles.sliderContainer}>
@@ -1305,27 +1238,26 @@ function HVSlider({ hv, setHv, disabled, hvStep, setHvStep }) {
         <Text style={styles.knobUnit}>V</Text>
       </View>
 
-      {/* Track */}
-      <View style={styles.sliderTrack} {...panResponder.panHandlers}>
-        {/* Fill */}
-        <View style={[styles.sliderFill, { width: `${pct}%` }]} />
-        {/* Thumb */}
-        <Animated.View
-          style={[
-            styles.sliderThumb,
-            { left: thumbX },
-            disabled && styles.sliderThumbDisabled,
-          ]}
-        />
-      </View>
+      <TextInput
+        style={[styles.hvInput, disabled && styles.hvInputDisabled]}
+        value={hvInput}
+        onChangeText={setHvInput}
+        onEndEditing={applyHvInput}
+        onSubmitEditing={applyHvInput}
+        keyboardType="numeric"
+        editable={!disabled}
+        maxLength={4}
+        placeholder="HV"
+        placeholderTextColor="#6b7f99"
+      />
 
       <View style={styles.sliderLabels}>
         <Text style={styles.sliderEdge}>◄ CCW</Text>
         <Text style={styles.sliderEdge}>CW ►</Text>
       </View>
 
-      {/* ── HV Step selector ───────────────────────────────── */}
-      <Text style={styles.stepLabel}>HV STEP</Text>
+      {/* ── HV jump controls ───────────────────────────────── */}
+      <Text style={styles.stepLabel}>HV JUMP</Text>
       <View style={styles.stepRow}>
         {[30, 50].map((val) => (
           <TouchableOpacity
@@ -1334,13 +1266,17 @@ function HVSlider({ hv, setHv, disabled, hvStep, setHvStep }) {
               styles.stepBtn,
               hvStep === val && styles.stepBtnActive,
             ]}
-            onPress={() => setHvStep(val)}
+            onPress={() => {
+              setHvStep(val);
+              jumpHv(val);
+            }}
+            disabled={disabled}
             activeOpacity={0.7}
           >
             <Text style={[
               styles.stepBtnText,
               hvStep === val && styles.stepBtnTextActive,
-            ]}>{val} V</Text>
+            ]}>+{val} V</Text>
           </TouchableOpacity>
         ))}
       </View>
@@ -1587,40 +1523,6 @@ const styles = StyleSheet.create({
     color: '#7ab8e8',
     fontFamily: MONO,
   },
-  sliderTrack: {
-    width: SLIDER_WIDTH * 0.5,
-    height: 20,
-    backgroundColor: '#0a1828',
-    borderRadius: 10,
-    marginTop: 4,
-    overflow: 'visible',
-    justifyContent: 'center',
-  },
-  sliderFill: {
-    height: '100%',
-    backgroundColor: '#2563eb',
-    borderRadius: 10,
-  },
-  sliderThumb: {
-    position: 'absolute',
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: '#60a5fa',
-    borderWidth: 3,
-    borderColor: '#1d4ed8',
-    top: -4,
-    marginLeft: -14,
-    shadowColor: '#000',
-    shadowOffset: { width: 1, height: 2 },
-    shadowOpacity: 0.5,
-    shadowRadius: 2,
-    elevation: 4,
-  },
-  sliderThumbDisabled: {
-    backgroundColor: '#334155',
-    borderColor: '#475569',
-  },
   sliderLabels: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1639,6 +1541,26 @@ const styles = StyleSheet.create({
     color: '#5a8abf',
     fontStyle: 'italic',
     textAlign: 'center',
+  },
+  hvInput: {
+    width: '100%',
+    marginTop: 8,
+    borderWidth: 1.5,
+    borderColor: '#2a6abf',
+    borderRadius: 6,
+    backgroundColor: '#081324',
+    color: '#e2eaf8',
+    fontFamily: MONO,
+    fontSize: 18,
+    fontWeight: '700',
+    textAlign: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+  },
+  hvInputDisabled: {
+    backgroundColor: '#1f2937',
+    color: '#9ca3af',
+    borderColor: '#475569',
   },
 
   // ── HV Step toggle ────────────────────────────────────────────────────────

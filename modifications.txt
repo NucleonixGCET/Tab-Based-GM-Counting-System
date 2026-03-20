@@ -1,0 +1,2 @@
+1. HV text box
+2. Reading = Display no of stored data
