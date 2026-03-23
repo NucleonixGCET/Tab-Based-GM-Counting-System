@@ -26,6 +26,7 @@ import {
   StatusBar,
   SafeAreaView,
   Image,
+  ScrollView,
 } from 'react-native';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -46,15 +47,16 @@ const ACQ_LABELS = {
 const ACQ_MODE_ORDER = ['PRESET_TIME', 'CPS', 'CPM'];
 
 /** PROG sub-mode cycle states */
-const PROG_OFF             = 'OFF';
-const PROG_ACQ_SELECT      = 'ACQ_SELECT';      // ① ▲/▼ cycle ACQ mode
-const PROG_TIME_ADJUST     = 'TIME_ADJUST';     // ② ▲ increment digit · ▼ move cursor left
+const PROG_OFF = 'OFF';
+const PROG_ACQ_SELECT = 'ACQ_SELECT';      // ① ▲/▼ cycle ACQ mode
+const PROG_TIME_ADJUST = 'TIME_ADJUST';     // ② ▲ increment digit · ▼ move cursor left
 const PROG_READINGS_ADJUST = 'READINGS_ADJUST'; // ③ ▲ increment digit · ▼ move cursor left
-const PROG_LABEL_ASSIGN    = 'LABEL_ASSIGN';    // ④ ▲/▼ cycle label: SP → ST → BG
+const PROG_LABEL_ASSIGN = 'LABEL_ASSIGN';    // ④ ▲/▼ cycle label: SP → ST → BG
 const PROG_ITERATION_ADJUST = 'ITERATION_ADJUST'; // ⑤ ▲/▼ set iteration count (1–9)
-const PROG_HV_ADJUST       = 'HV_ADJUST';       // ⑥ ▲/▼ adjust HV by current slider step
-const PROG_SAVE_CONFIRM    = 'SAVE_CONFIRM';      // ⑦ press ▲/▼ to save · PROG to discard
-const PROG_SHOW_OK         = 'SHOW_OK';           // transient 1-second OK flash
+const PROG_DHV_ADJUST = 'DHV_ADJUST';       // ⑥ ▲/▼ set delta HV
+const PROG_HV_ADJUST = 'HV_ADJUST';       // ⑦ ▲/▼ adjust HV by current slider step
+const PROG_SAVE_CONFIRM = 'SAVE_CONFIRM';      // ⑧ press ▲/▼ to save · PROG to discard
+const PROG_SHOW_OK = 'SHOW_OK';           // transient 1-second OK flash
 
 const BOOT_GEIGER = 'BOOT_GEIGER';
 const BOOT_NUCLEONIX = 'BOOT_NUCLEONIX';
@@ -81,12 +83,13 @@ const PARAM_FIELD_TIMER = 'TIMER';
 const PARAM_FIELD_READINGS = 'READINGS';
 const PARAM_FIELD_LABEL = 'LABEL';
 const PARAM_FIELD_ITERATIONS = 'ITERATIONS';
+const PARAM_FIELD_DHV = 'DHV';
 
-const PARAM_FIELD_ORDER = [PARAM_FIELD_TIMER, PARAM_FIELD_READINGS, PARAM_FIELD_LABEL, PARAM_FIELD_ITERATIONS];
+const PARAM_FIELD_ORDER = [PARAM_FIELD_TIMER, PARAM_FIELD_READINGS, PARAM_FIELD_LABEL, PARAM_FIELD_ITERATIONS, PARAM_FIELD_DHV];
 
 /** Label options */
 const LABEL_OPTIONS = ['SP', 'ST', 'BG'];
-const LABEL_NAMES   = { SP: 'Sample', ST: 'Standard', BG: 'Background' };
+const LABEL_NAMES = { SP: 'Sample', ST: 'Standard', BG: 'Background' };
 
 /** Convert a 1–9999 number into [thousands, hundreds, tens, units] digit array */
 const numToDigits = (n) => {
@@ -153,10 +156,12 @@ function GMCountingScreen() {
   const [label, setLabel] = useState('SP');
   const [draftLabel, setDraftLabel] = useState('SP');
 
-  // Iteration (used during PROG_ITERATION_ADJUST)
+  // Iteration & dHV (used during PROG cycles)
   const DEFAULT_ITERATIONS = 1;
   const [iterations, setIterations] = useState(DEFAULT_ITERATIONS);      // committed
   const [draftIterations, setDraftIterations] = useState(DEFAULT_ITERATIONS); // staging
+  const [dHv, setDHv] = useState(0);              // committed delta HV
+  const [draftDHv, setDraftDHv] = useState(0);    // staging delta HV
   const [activeParamField, setActiveParamField] = useState(PARAM_FIELD_TIMER);  // NEW: tracks which parameter is shown
   // Runtime iteration tracking
   const [currentIteration, setCurrentIteration] = useState(0);           // which cycle we're on
@@ -202,6 +207,7 @@ function GMCountingScreen() {
       presetTime,
       label,
       iterations,
+      dHv,
     };
 
     programSessionRef.current = snapshot;
@@ -210,6 +216,7 @@ function GMCountingScreen() {
     setCursorPos(0);
     setDraftLabel(snapshot.label);
     setDraftIterations(snapshot.iterations);
+    setDraftDHv(snapshot.dHv);
   };
 
   const discardProgrammingSession = () => {
@@ -220,6 +227,7 @@ function GMCountingScreen() {
       setDraftDigits(numToDigits(snapshot.presetTime));
       setDraftLabel(snapshot.label);
       setDraftIterations(snapshot.iterations);
+      setDraftDHv(snapshot.dHv);
     }
 
     setCursorPos(0);
@@ -235,6 +243,7 @@ function GMCountingScreen() {
     setPresetTime(nextPresetTime);
     setLabel(draftLabel);
     setIterations(draftIterations);
+    setDHv(draftDHv);
     setActiveParamField(PARAM_FIELD_TIMER);  // Reset to default parameter
     programSessionRef.current = null;
 
@@ -284,6 +293,8 @@ function GMCountingScreen() {
       numberOfReadings: storedReadings.length,
       label,
       iterations,
+      dHv,
+      iterationResults: [...iterationResultsRef.current],
       hv,
       storeDataMode,
       outputRoute,
@@ -344,7 +355,7 @@ function GMCountingScreen() {
             clearInterval(intervalRef.current);
             // Store this cycle's count
             setCounts((finalCount) => {
-              iterationResultsRef.current.push(finalCount);
+              iterationResultsRef.current.push({ count: finalCount, hv: hv });
               const doneCount = iterationResultsRef.current.length;
               if (doneCount < iterations) {
                 // More iterations to go — auto-restart after a brief pause
@@ -352,11 +363,14 @@ function GMCountingScreen() {
                   setCounts(0);
                   setElapsedTime(0);
                   setCurrentIteration(doneCount + 1);
+                  if (dHv > 0) {
+                    setHv((currentHv) => Math.min(currentHv + dHv, HV_MAX));
+                  }
                   setIterationRestartToken((v) => v + 1);
                 }, 400);
               } else {
                 // All done — compute and display average
-                const total = iterationResultsRef.current.reduce((a, b) => a + b, 0);
+                const total = iterationResultsRef.current.reduce((a, b) => a + b.count, 0);
                 const avg = Math.round(total / doneCount);
                 const completedValue = doneCount > 1 ? avg : finalCount;
                 setDisplayedCounts(avg);
@@ -447,8 +461,15 @@ function GMCountingScreen() {
       return;
     }
 
-    // From ITERATION_ADJUST, move to HV_ADJUST
+    // From ITERATION_ADJUST, cycle to DHV_ADJUST
     if (progSub === PROG_ITERATION_ADJUST) {
+      setProgSub(PROG_DHV_ADJUST);
+      setActiveParamField(PARAM_FIELD_DHV);
+      return;
+    }
+
+    // From DHV_ADJUST, move to HV_ADJUST
+    if (progSub === PROG_DHV_ADJUST) {
       setProgSub(PROG_HV_ADJUST);
       return;
     }
@@ -486,11 +507,6 @@ function GMCountingScreen() {
     }
 
     if (dataMode === DATA_ERASE_CONFIRM) {
-      setStoredReadings([]);
-      setPendingMeasurement(null);
-      setRecallIndex(-1);
-      nextSerialNoRef.current = 1;
-      showDataMessage('MEMORY CLEARED');
       return;
     }
 
@@ -525,6 +541,10 @@ function GMCountingScreen() {
       // ▲ → increment iteration count (max 9)
       setDraftIterations((n) => Math.min(n + 1, 9));
 
+    } else if (progSub === PROG_DHV_ADJUST) {
+      // ▲ → increment dHV by 5 (max 100)
+      setDraftDHv((v) => Math.min(v + 5, 100));
+
     } else if (progSub === PROG_HV_ADJUST) {
       // ▲ → increase HV by the current slider step
       setHv((v) => Math.min(v + hvStep, HV_MAX));
@@ -554,11 +574,6 @@ function GMCountingScreen() {
     }
 
     if (dataMode === DATA_ERASE_CONFIRM) {
-      setStoredReadings([]);
-      setPendingMeasurement(null);
-      setRecallIndex(-1);
-      nextSerialNoRef.current = 1;
-      showDataMessage('MEMORY CLEARED');
       return;
     }
 
@@ -588,6 +603,10 @@ function GMCountingScreen() {
     } else if (progSub === PROG_ITERATION_ADJUST) {
       // ▼ → decrement iteration count (min 1)
       setDraftIterations((n) => Math.max(n - 1, 1));
+
+    } else if (progSub === PROG_DHV_ADJUST) {
+      // ▼ → decrement dHV by 5 (min 0)
+      setDraftDHv((v) => Math.max(v - 5, 0));
 
     } else if (progSub === PROG_HV_ADJUST) {
       // ▼ → decrease HV by the current slider step
@@ -658,6 +677,15 @@ function GMCountingScreen() {
     cycleDataMode();
   };
 
+  const handleEraseData = () => {
+    if (dataMode !== DATA_ERASE_CONFIRM) return;
+    setStoredReadings([]);
+    setPendingMeasurement(null);
+    setRecallIndex(-1);
+    nextSerialNoRef.current = 1;
+    showDataMessage('MEMORY CLEARED');
+  };
+
   // ── Derived display values ────────────────────────────────────────────────
   const remainingTime = acqMode === 'PRESET_TIME'
     ? Math.max(presetTime - elapsedTime, 0)
@@ -689,22 +717,22 @@ function GMCountingScreen() {
   // ── PROG cycle label helpers ──────────────────────────────────────────────
   const progLabel =
     isBooting ? 'Boot sequence in progress'
-    : dataMode === DATA_STORE_MODE ? '▲ / ▼  →  Toggle AUTO/MANUAL  ·  STORE → Next'
-    : dataMode === DATA_OUTPUT_ROUTE ? '▲ / ▼  →  Select USB-PC or PRINTER  ·  STORE → Next'
-    : dataMode === DATA_RECALL ? '▲ / ▼  →  Scroll by Sl.No.  ·  STORE → Next'
-    : dataMode === DATA_ERASE_CONFIRM ? 'Press ▲ or ▼ to ERASE memory  ·  STORE → Exit'
-    : dataMode === DATA_MESSAGE ? dataMessage
-    : progSub === PROG_ACQ_SELECT        ? '▲ / ▼  →  Select ACQ Mode'
-    : progSub === PROG_TIME_ADJUST     ? '▲ → Increment digit  ·  ▼ → Move cursor left  (Preset Time)'
-    : progSub === PROG_READINGS_ADJUST ? 'READINGS shows total MEM count (read-only)'
-    : progSub === PROG_LABEL_ASSIGN    ? '▲ / ▼  →  Cycle label  [SP · ST · BG]'
-    : progSub === PROG_ITERATION_ADJUST ? '▲/▼ set iterations (1-9)'
-    : progSub === PROG_HV_ADJUST ? `▲/▼ adjust HV by ${hvStep} V step`
-    : progSub === PROG_SAVE_CONFIRM    ? 'Press ▲ or ▼ to SAVE  ·  Press PROG to discard'
-    : progSub === PROG_SHOW_OK         ? 'Settings saved!'
-    : storeDataMode === STORE_MODE_MANUAL
-      ? 'STORE saves pending reading  ·  Long press STORE for memory menu'
-      : 'Press PROG to enter programming mode  ·  Long press STORE for memory menu';
+      : dataMode === DATA_STORE_MODE ? '▲ / ▼  →  Toggle AUTO/MANUAL  ·  STORE → Next'
+        : dataMode === DATA_OUTPUT_ROUTE ? '▲ / ▼  →  Select USB-PC or PRINTER  ·  STORE → Next'
+          : dataMode === DATA_RECALL ? '▲ / ▼  →  Scroll by Sl.No.  ·  STORE → Next'
+            : dataMode === DATA_ERASE_CONFIRM ? 'Press ▲ or ▼ to ERASE memory  ·  STORE → Exit'
+              : dataMode === DATA_MESSAGE ? dataMessage
+                : progSub === PROG_ACQ_SELECT ? '▲ / ▼  →  Select ACQ Mode'
+                  : progSub === PROG_TIME_ADJUST ? '▲ → Increment digit  ·  ▼ → Move cursor left  (Preset Time)'
+                    : progSub === PROG_READINGS_ADJUST ? 'READINGS shows total MEM count (read-only)'
+                      : progSub === PROG_LABEL_ASSIGN ? '▲ / ▼  →  Cycle label  [SP · ST · BG]'
+                        : progSub === PROG_ITERATION_ADJUST ? '▲/▼ set iterations (1-9)'
+                          : progSub === PROG_HV_ADJUST ? `▲/▼ adjust HV by ${hvStep} V step`
+                            : progSub === PROG_SAVE_CONFIRM ? 'Press ▲ or ▼ to SAVE  ·  Press PROG to discard'
+                              : progSub === PROG_SHOW_OK ? 'Settings saved!'
+                                : storeDataMode === STORE_MODE_MANUAL
+                                  ? 'STORE saves pending reading  ·  Long press STORE for memory menu'
+                                  : 'Press PROG to enter programming mode  ·  Long press STORE for memory menu';
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -728,14 +756,14 @@ function GMCountingScreen() {
           {isProgOn && !isBooting && (
             <View style={[styles.badge, styles.badgeProg]}>
               <Text style={styles.badgeProgText}>
-                {progSub === PROG_ACQ_SELECT        ? 'ACQ SELECT'
-                  : progSub === PROG_TIME_ADJUST    ? 'TIME ADJUST'
-                  : progSub === PROG_READINGS_ADJUST ? 'READINGS'
-                  : progSub === PROG_LABEL_ASSIGN   ? 'LABEL'
-                  : progSub === PROG_ITERATION_ADJUST ? 'ITERATIONS'
-                  : progSub === PROG_HV_ADJUST ? 'HV ADJUST'
-                  : progSub === PROG_SAVE_CONFIRM   ? 'SAVE?'
-                  : 'SAVED ✓'}
+                {progSub === PROG_ACQ_SELECT ? 'ACQ SELECT'
+                  : progSub === PROG_TIME_ADJUST ? 'TIME ADJUST'
+                    : progSub === PROG_READINGS_ADJUST ? 'READINGS'
+                      : progSub === PROG_LABEL_ASSIGN ? 'LABEL'
+                        : progSub === PROG_ITERATION_ADJUST ? 'ITERATIONS'
+                          : progSub === PROG_HV_ADJUST ? 'HV ADJUST'
+                            : progSub === PROG_SAVE_CONFIRM ? 'SAVE?'
+                              : 'SAVED ✓'}
               </Text>
             </View>
           )}
@@ -744,9 +772,9 @@ function GMCountingScreen() {
               <Text style={styles.badgeDataText}>
                 {dataMode === DATA_STORE_MODE ? 'STORE DATA'
                   : dataMode === DATA_OUTPUT_ROUTE ? 'DATA OUT'
-                  : dataMode === DATA_RECALL ? 'RECALL'
-                  : dataMode === DATA_ERASE_CONFIRM ? 'ERASE?'
-                  : dataMessage}
+                    : dataMode === DATA_RECALL ? 'RECALL'
+                      : dataMode === DATA_ERASE_CONFIRM ? 'ERASE?'
+                        : dataMessage}
               </Text>
             </View>
           )}
@@ -801,18 +829,47 @@ function GMCountingScreen() {
 
             {!isBooting && dataMode === DATA_RECALL && (
               <View style={styles.overlayScreen}>
-                <Text style={styles.overlayLine1}>RECALL</Text>
-                <Text style={styles.overlayLine2}>DATA</Text>
-                {currentRecallEntry ? (
-                  <>
-                    <Text style={styles.memoryValue}>Sl.No. {String(currentRecallEntry.serialNo).padStart(4, '0')}</Text>
-                    <Text style={styles.overlaySub}>Counts {String(currentRecallEntry.value).padStart(6, '0')}</Text>
-                    <Text style={styles.overlaySub}>{ACQ_LABELS[currentRecallEntry.acqMode]}  ·  {currentRecallEntry.label}</Text>
-                    <Text style={styles.overlaySub}>HV {formatHV(currentRecallEntry.hv)} V  ·  OUT {OUTPUT_ROUTE_LABELS[currentRecallEntry.outputRoute]}</Text>
-                  </>
-                ) : (
-                  <Text style={styles.overlaySub}>No stored readings</Text>
-                )}
+                <ScrollView contentContainerStyle={{ alignItems: 'center', justifyContent: 'center', flexGrow: 1, paddingVertical: 24 }} style={{ width: '100%' }} persistentScrollbar={true}>
+                  <Text style={styles.overlayLine1}>RECALL</Text>
+                  <Text style={styles.overlayLine2}>DATA</Text>
+                  {currentRecallEntry ? (
+                    <>
+                      <Text style={[styles.memoryValue, { marginTop: 16 }]}>Sl.No. {String(currentRecallEntry.serialNo).padStart(4, '0')}</Text>
+                      <Text style={[styles.overlaySub, { fontSize: 28, fontWeight: '700', color: '#f8fafc', marginVertical: 4 }]}>
+                        Counts: {String(currentRecallEntry.value).padStart(6, '0')} {currentRecallEntry.iterations > 1 ? '(AVG)' : ''}
+                      </Text>
+                      <Text style={[styles.overlaySub, { fontSize: 20, marginBottom: 2 }]}>
+                        {ACQ_LABELS[currentRecallEntry.acqMode]} {currentRecallEntry.acqMode === 'PRESET_TIME' ? `(${currentRecallEntry.presetTime}s)` : ''}  ·  {currentRecallEntry.label}  ·  HV {formatHV(currentRecallEntry.hv)}V
+                      </Text>
+                      <Text style={[styles.overlaySub, { fontSize: 18, marginBottom: 8 }]}>
+                        OUT {OUTPUT_ROUTE_LABELS[currentRecallEntry.outputRoute]}
+                      </Text>
+                      {currentRecallEntry.iterations > 1 && currentRecallEntry.iterationResults && currentRecallEntry.iterationResults.length > 0 && (
+                        <View style={styles.iterTableContainer}>
+                            <View style={styles.iterTableHeader}>
+                              <Text style={styles.iterTableColHeader}>Run</Text>
+                              <Text style={styles.iterTableColHeader}>HV (V)</Text>
+                              <Text style={styles.iterTableColHeader}>Count</Text>
+                            </View>
+                            {currentRecallEntry.iterationResults.map((item, idx) => {
+                              const val = typeof item === 'object' ? item.count : item;
+                              const stepHv = typeof item === 'object' ? item.hv : currentRecallEntry.hv;
+
+                              return (
+                                <View key={idx} style={styles.iterTableRow}>
+                                  <Text style={styles.iterTableCol1}>{idx + 1}</Text>
+                                  <Text style={[styles.iterTableCol1, { color: '#fb923c' }]}>{stepHv}</Text>
+                                  <Text style={styles.iterTableCol2}>{String(val).padStart(6, '0')}</Text>
+                                </View>
+                              );
+                            })}
+                        </View>
+                      )}
+                    </>
+                  ) : (
+                    <Text style={[styles.overlaySub, { marginTop: 16 }]}>No stored readings</Text>
+                  )}
+                </ScrollView>
               </View>
             )}
 
@@ -821,8 +878,10 @@ function GMCountingScreen() {
                 <Text style={styles.overlayLine1}>ERASE?</Text>
                 <Text style={styles.overlayLine2}>(MEM)</Text>
                 <Text style={styles.overlaySub}>Stored records: {String(memoryCount).padStart(4, '0')}</Text>
-                <Text style={styles.overlaySub}>▲ or ▼  →  Confirm erase all</Text>
-                <Text style={styles.overlaySub}>STORE  {'→'}  Exit erase mode</Text>
+                <TouchableOpacity style={styles.eraseBtn} onPress={handleEraseData} activeOpacity={0.7}>
+                  <Text style={styles.eraseBtnText}>ERASE MEMORY</Text>
+                </TouchableOpacity>
+                <Text style={[styles.overlaySub, { marginTop: 16 }]}>STORE  {'→'}  Exit erase mode</Text>
               </View>
             )}
 
@@ -938,186 +997,213 @@ function GMCountingScreen() {
               && progSub !== PROG_LABEL_ASSIGN
               && progSub !== PROG_ITERATION_ADJUST
               && progSub !== PROG_HV_ADJUST && (
-              <>
-                {/* === LINE 1: Count/AVG (always visible) === */}
-                <View style={styles.displayRow}>
-                  <Text style={styles.displayLabel}>
-                    {acqMode === 'CPM' ? 'CPM :'
-                      : acqMode === 'CPS' ? 'CPS :'
-                      : (iterations > 1 && !isRunning && iterationResultsRef.current.length > 0)
-                        ? 'AVG :'
-                        : 'COUNT :'}
-                  </Text>
-                  <Text style={styles.displayValue}>{formatCounts(displayResult)}</Text>
-                  {currentIteration > 0 && isRunning && (
-                    <Text style={styles.iterChip}>{currentIteration}/{iterations}</Text>
+                <>
+                  {/* === LINE 1: Count/AVG (always visible) === */}
+                  <View style={styles.displayRow}>
+                    <Text style={styles.displayLabel}>
+                      {acqMode === 'CPM' ? 'CPM :'
+                        : acqMode === 'CPS' ? 'CPS :'
+                          : (iterations > 1 && !isRunning && iterationResultsRef.current.length > 0)
+                            ? 'AVG :'
+                            : 'COUNT :'}
+                    </Text>
+                    <Text style={styles.displayValue}>{formatCounts(displayResult)}</Text>
+                    {currentIteration > 0 && isRunning && (
+                      <Text style={styles.iterChip}>{currentIteration}/{iterations}</Text>
+                    )}
+                  </View>
+
+                  <View style={styles.displayDivider} />
+
+                  {/* === LINE 2: Active Parameter Field (one shown at a time) === */}
+
+                  {/* TIMER - PR.TIME field */}
+                  {progSub === PROG_TIME_ADJUST && (
+                    <View style={{ paddingVertical: 4 }}>
+                      <Text style={styles.progEditHeader}>PRESET</Text>
+                      <View style={styles.progEditRow}>
+                        <Text style={styles.progEditLabel}>TIME</Text>
+                        <View style={styles.digitRow}>
+                          {draftDigits.map((digit, idx) => (
+                            <View key={idx} style={styles.digitCell}>
+                              <Text style={[
+                                styles.cursorArrow,
+                                idx === cursorPos ? styles.cursorArrowActive : styles.cursorArrowHidden,
+                              ]}>▲</Text>
+                              <Text style={[
+                                styles.digitChar,
+                                idx === cursorPos && styles.digitCharActive,
+                              ]}>{digit}</Text>
+                            </View>
+                          ))}
+                        </View>
+                        <Text style={styles.displayUnit}> s</Text>
+                      </View>
+                    </View>
                   )}
-                </View>
 
-                <View style={styles.displayDivider} />
+                  {/* READINGS - REAIN field */}
+                  {progSub === PROG_READINGS_ADJUST && (
+                    <View style={{ paddingVertical: 4 }}>
+                      <Text style={styles.progEditHeader}>READINGS IN</Text>
+                      <View style={styles.progEditRow}>
+                        <Text style={styles.progEditLabel}>REAIN</Text>
+                        <Text style={styles.progEditHv}>{formatPRTime(memoryCount)}</Text>
+                      </View>
+                    </View>
+                  )}
 
-                {/* === LINE 2: Active Parameter Field (one shown at a time) === */}
-
-                {/* TIMER - PR.TIME field */}
-                {progSub === PROG_TIME_ADJUST && (
-                  <View style={{ paddingVertical: 4 }}>
-                    <Text style={styles.progEditHeader}>PRESET</Text>
-                    <View style={styles.progEditRow}>
-                      <Text style={styles.progEditLabel}>TIME</Text>
-                      <View style={styles.digitRow}>
-                        {draftDigits.map((digit, idx) => (
-                          <View key={idx} style={styles.digitCell}>
+                  {/* LABEL - LABLE field */}
+                  {progSub === PROG_LABEL_ASSIGN && (
+                    <View style={styles.overlayScreen}>
+                      <Text style={styles.progEditHeader}>LABLE</Text>
+                      <View style={styles.labelSelectRow}>
+                        {LABEL_OPTIONS.map((opt) => (
+                          <View key={opt} style={[
+                            styles.labelOption,
+                            draftLabel === opt && styles.labelOptionActive,
+                          ]}>
                             <Text style={[
-                              styles.cursorArrow,
-                              idx === cursorPos ? styles.cursorArrowActive : styles.cursorArrowHidden,
-                            ]}>▲</Text>
-                            <Text style={[
-                              styles.digitChar,
-                              idx === cursorPos && styles.digitCharActive,
-                            ]}>{digit}</Text>
+                              styles.labelOptionText,
+                              draftLabel === opt && styles.labelOptionTextActive,
+                            ]}>{opt}</Text>
                           </View>
                         ))}
                       </View>
-                      <Text style={styles.displayUnit}> s</Text>
+                      <Text style={styles.labelDesc}>{LABEL_NAMES[draftLabel]}</Text>
                     </View>
-                  </View>
-                )}
+                  )}
 
-                {/* READINGS - REAIN field */}
-                {progSub === PROG_READINGS_ADJUST && (
-                  <View style={{ paddingVertical: 4 }}>
-                    <Text style={styles.progEditHeader}>READINGS IN</Text>
-                    <View style={styles.progEditRow}>
-                      <Text style={styles.progEditLabel}>REAIN</Text>
-                      <Text style={styles.progEditHv}>{formatPRTime(memoryCount)}</Text>
+                  {/* ITERATIONS - ITERATION field */}
+                  {progSub === PROG_ITERATION_ADJUST && (
+                    <View style={styles.overlayScreen}>
+                      <Text style={styles.progEditHeader}>ITERATION</Text>
+                      <View style={styles.iterBoxRow}>
+                        <Text style={[styles.iterValue, styles.iterValueActive]}>{draftIterations}</Text>
+                      </View>
+                      <Text style={[styles.labelDesc, { marginTop: 4 }]}>
+                        {draftIterations === 1 ? 'Single run' : `Run ×${draftIterations}, display average`}
+                      </Text>
+                      <View style={styles.iterBoxRow}>
+                        <Text style={styles.progEditLabel}>HV</Text>
+                        <Text style={styles.iterValueSmall}>
+                          {formatHV(hv)} V
+                        </Text>
+                      </View>
                     </View>
-                  </View>
-                )}
+                  )}
 
-                {/* LABEL - LABLE field */}
-                {progSub === PROG_LABEL_ASSIGN && (
-                  <View style={styles.overlayScreen}>
-                    <Text style={styles.progEditHeader}>LABLE</Text>
-                    <View style={styles.labelSelectRow}>
-                      {LABEL_OPTIONS.map((opt) => (
-                        <View key={opt} style={[
-                          styles.labelOption,
-                          draftLabel === opt && styles.labelOptionActive,
-                        ]}>
-                          <Text style={[
-                            styles.labelOptionText,
-                            draftLabel === opt && styles.labelOptionTextActive,
-                          ]}>{opt}</Text>
-                        </View>
-                      ))}
-                    </View>
-                    <Text style={styles.labelDesc}>{LABEL_NAMES[draftLabel]}</Text>
-                  </View>
-                )}
-
-                {/* ITERATIONS - ITERATION field */}
-                {progSub === PROG_ITERATION_ADJUST && (
-                  <View style={styles.overlayScreen}>
-                    <Text style={styles.progEditHeader}>ITERATION</Text>
-                    <View style={styles.iterBoxRow}>
-                      <Text style={[styles.iterValue, styles.iterValueActive]}>{draftIterations}</Text>
-                    </View>
-                    <Text style={[styles.labelDesc, { marginTop: 4 }]}>
-                      {draftIterations === 1 ? 'Single run' : `Run ×${draftIterations}, display average`}
-                    </Text>
-                    <View style={styles.iterBoxRow}>
-                      <Text style={styles.progEditLabel}>HV</Text>
-                      <Text style={styles.iterValueSmall}>
-                        {formatHV(hv)} V
+                  {/* dHV - DHV_ADJUST field */}
+                  {progSub === PROG_DHV_ADJUST && (
+                    <View style={styles.overlayScreen}>
+                      <Text style={styles.progEditHeader}>dHV STEP</Text>
+                      <View style={styles.iterBoxRow}>
+                        <Text style={[styles.iterValue, styles.iterValueActive]}>+{draftDHv} V</Text>
+                      </View>
+                      <Text style={[styles.labelDesc, { marginTop: 4 }]}>
+                        {draftDHv === 0 ? 'Constant HV for all runs' : `Increase HV by ${draftDHv}V each run`}
                       </Text>
                     </View>
-                  </View>
-                )}
+                  )}
 
-                {/* When in ACQ_SELECT mode, show a simplified view */}
-                {progSub === PROG_ACQ_SELECT && (
-                  <View style={styles.overlayScreen}>
-                    <Text style={styles.progEditHeader}>ACQ MODE</Text>
-                    <View style={[
-                      styles.modeTag,
-                      displayAcqMode === 'CPS' && styles.modeTagCPS,
-                      displayAcqMode === 'CPM' && styles.modeTagCPM,
-                      styles.modeTagEditing,
-                    ]}>
-                      <Text style={styles.modeTagText}>{ACQ_LABELS[displayAcqMode]}</Text>
+                  {/* When in ACQ_SELECT mode, show a simplified view */}
+                  {progSub === PROG_ACQ_SELECT && (
+                    <View style={styles.overlayScreen}>
+                      <Text style={styles.progEditHeader}>ACQ MODE</Text>
+                      <View style={[
+                        styles.modeTag,
+                        displayAcqMode === 'CPS' && styles.modeTagCPS,
+                        displayAcqMode === 'CPM' && styles.modeTagCPM,
+                        styles.modeTagEditing,
+                      ]}>
+                        <Text style={styles.modeTagText}>{ACQ_LABELS[displayAcqMode]}</Text>
+                      </View>
+                      <Text style={styles.overlaySub}>▲ / ▼ to cycle modes</Text>
                     </View>
-                    <Text style={styles.overlaySub}>▲ / ▼ to cycle modes</Text>
-                  </View>
-                )}
+                  )}
 
-                {/* When PROG_OFF (not editing), show the 4 parameters in a clean rotating display based on activeParamField */}
-                {progSub === PROG_OFF && activeParamField === PARAM_FIELD_TIMER && (
-                  <View style={styles.displayRow}>
-                    <Text style={styles.displayLabel}>PR.TIME :</Text>
-                    {acqMode === 'PRESET_TIME' && !isRunning ? (
-                      <Text style={styles.displayValue}>{formatPRTime(presetTime)}</Text>
-                    ) : (
-                      <Text style={[
-                        styles.displayValue,
-                        acqMode !== 'PRESET_TIME' && styles.displayValueDim,
-                      ]}>{formatPRTime(remainingTime)}</Text>
-                    )}
-                    <Text style={styles.displayUnit}> s</Text>
-                  </View>
-                )}
+                  {(activeParamField === PARAM_FIELD_ITERATIONS || (progSub === PROG_ITERATION_ADJUST)) && (
+                    <View style={[styles.paramBox, progSub === PROG_ITERATION_ADJUST && styles.paramBoxActive]}>
+                      <Text style={styles.paramLabel}>ITERATIONS</Text>
+                      <Text style={styles.paramValue}>{progSub === PROG_ITERATION_ADJUST ? draftIterations : iterations}</Text>
+                    </View>
+                  )}
 
-                {progSub === PROG_OFF && activeParamField === PARAM_FIELD_READINGS && (
+                  {(activeParamField === PARAM_FIELD_DHV || (progSub === PROG_DHV_ADJUST)) && (
+                    <View style={[styles.paramBox, progSub === PROG_DHV_ADJUST && styles.paramBoxActive]}>
+                      <Text style={styles.paramLabel}>dHV STEP</Text>
+                      <Text style={styles.paramValue}>+{progSub === PROG_DHV_ADJUST ? draftDHv : dHv}V</Text>
+                    </View>
+                  )}
+
+                  {/* When PROG_OFF (not editing), show the 4 parameters in a clean rotating display based on activeParamField */}
+                  {progSub === PROG_OFF && activeParamField === PARAM_FIELD_TIMER && (
+                    <View style={styles.displayRow}>
+                      <Text style={styles.displayLabel}>PR.TIME :</Text>
+                      {acqMode === 'PRESET_TIME' && !isRunning ? (
+                        <Text style={styles.displayValue}>{formatPRTime(presetTime)}</Text>
+                      ) : (
+                        <Text style={[
+                          styles.displayValue,
+                          acqMode !== 'PRESET_TIME' && styles.displayValueDim,
+                        ]}>{formatPRTime(remainingTime)}</Text>
+                      )}
+                      <Text style={styles.displayUnit}> s</Text>
+                    </View>
+                  )}
+
+                  {progSub === PROG_OFF && activeParamField === PARAM_FIELD_READINGS && (
+                    <View style={styles.displayRow}>
+                      <Text style={styles.displayLabel}>MEM :</Text>
+                      <Text style={styles.displayValue}>
+                        {formatPRTime(memoryCount)}
+                      </Text>
+                    </View>
+                  )}
+
+                  {progSub === PROG_OFF && activeParamField === PARAM_FIELD_LABEL && (
+                    <View style={styles.displayRow}>
+                      <Text style={styles.displayLabel}>LABEL :</Text>
+                      <Text style={[styles.displayValue, { color: '#a78bfa', letterSpacing: 2 }]}>
+                        {label}
+                      </Text>
+                      <Text style={[styles.displayUnit, { color: '#7c6cc4' }]}>
+                        {'  '}{LABEL_NAMES[label]}
+                      </Text>
+                    </View>
+                  )}
+
+                  {progSub === PROG_OFF && activeParamField === PARAM_FIELD_ITERATIONS && (
+                    <View style={styles.displayRow}>
+                      <Text style={styles.displayLabel}>ITERATIONS :</Text>
+                      <Text style={styles.displayValue}>{iterations}</Text>
+                      {iterations > 1 && (
+                        <Text style={[styles.displayUnit, { color: '#38bdf8' }]}>{' '}avg</Text>
+                      )}
+                    </View>
+                  )}
+
+                  <View style={styles.displayDivider} />
+
+                  {/* === LINE 3: HV (always visible at bottom) === */}
                   <View style={styles.displayRow}>
-                    <Text style={styles.displayLabel}>MEM :</Text>
+                    <Text style={[
+                      styles.playIndicator,
+                      isRunning && styles.playIndicatorActive,
+                    ]}>▶</Text>
+                    <Text style={styles.displayLabel}>HV :</Text>
                     <Text style={styles.displayValue}>
-                      {formatPRTime(memoryCount)}
+                      {formatHV(hv)}
                     </Text>
+                    <Text style={styles.displayUnit}> V</Text>
                   </View>
-                )}
-
-                {progSub === PROG_OFF && activeParamField === PARAM_FIELD_LABEL && (
-                  <View style={styles.displayRow}>
-                    <Text style={styles.displayLabel}>LABEL :</Text>
-                    <Text style={[styles.displayValue, { color: '#a78bfa', letterSpacing: 2 }]}>
-                      {label}
-                    </Text>
-                    <Text style={[styles.displayUnit, { color: '#7c6cc4' }]}>
-                      {'  '}{LABEL_NAMES[label]}
-                    </Text>
-                  </View>
-                )}
-
-                {progSub === PROG_OFF && activeParamField === PARAM_FIELD_ITERATIONS && (
-                  <View style={styles.displayRow}>
-                    <Text style={styles.displayLabel}>ITERATIONS :</Text>
-                    <Text style={styles.displayValue}>{iterations}</Text>
-                    {iterations > 1 && (
-                      <Text style={[styles.displayUnit, { color: '#38bdf8' }]}>{' '}avg</Text>
-                    )}
-                  </View>
-                )}
-
-                <View style={styles.displayDivider} />
-
-                {/* === LINE 3: HV (always visible at bottom) === */}
-                <View style={styles.displayRow}>
-                  <Text style={[
-                    styles.playIndicator,
-                    isRunning && styles.playIndicatorActive,
-                  ]}>▶</Text>
-                  <Text style={styles.displayLabel}>HV :</Text>
-                  <Text style={styles.displayValue}>
-                    {formatHV(hv)}
-                  </Text>
-                  <Text style={styles.displayUnit}> V</Text>
-                </View>
-              </>
-            )}
+                </>
+              )}
 
           </View>
 
           {/* ── HV Helipot Slider ───────────────────────────────────────────── */}
-            <HVSlider hv={hv} setHv={setHv} disabled={isRunning || isBooting || isDataModeOn} hvStep={hvStep} setHvStep={setHvStep}/>
+          <HVSlider hv={hv} setHv={setHv} disabled={isRunning || isBooting || isDataModeOn} hvStep={hvStep} setHvStep={setHvStep} />
         </View>
 
         {/* ── Button grid ────────────────────────────────────────────────── */}
@@ -1137,9 +1223,10 @@ function GMCountingScreen() {
                       : progSub === PROG_READINGS_ADJUST ? '③'
                         : progSub === PROG_LABEL_ASSIGN ? '④'
                           : progSub === PROG_ITERATION_ADJUST ? '⑤'
-                            : progSub === PROG_HV_ADJUST ? '⑥'
-                              : progSub === PROG_SAVE_CONFIRM ? '⑦'
-                              : '✓'}
+                            : progSub === PROG_DHV_ADJUST ? '⑥'
+                              : progSub === PROG_HV_ADJUST ? '⑦'
+                                : progSub === PROG_SAVE_CONFIRM ? '⑧'
+                                  : '✓'}
                 </Text>
               )}
             </TouchableOpacity>
@@ -1309,14 +1396,16 @@ const styles = StyleSheet.create({
   },
 
   outerPanel: {
-    width: '95%',
-    maxWidth: 900,
+    width: '98%',
+    flex: 0.98,
+    maxWidth: 1600,
     backgroundColor: PANEL_BG,
     borderWidth: 3,
     borderColor: BORDER,
     borderRadius: 6,
-    paddingVertical: 20,
-    paddingHorizontal: 24,
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    justifyContent: 'space-between',
     alignItems: 'center',
     shadowColor: '#000',
     shadowOffset: { width: 3, height: 4 },
@@ -1326,14 +1415,14 @@ const styles = StyleSheet.create({
   },
 
   logo: {
-    width: 180,
+    width: 200,
     height: 60,
     alignSelf: 'center',
-    marginBottom: 6,
+    marginBottom: 4,
   },
 
   title: {
-    fontSize: 26,
+    fontSize: 32,
     fontWeight: '700',
     color: TEXT_DARK,
     letterSpacing: 1.2,
@@ -1357,36 +1446,37 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   badgeProg: { backgroundColor: '#1e3a6a55', borderColor: PROG_COLOR },
-  badgeProgText: { color: PROG_COLOR, fontWeight: '700', fontSize: 12, letterSpacing: 0.8 },
+  badgeProgText: { color: PROG_COLOR, fontWeight: '700', fontSize: 16, letterSpacing: 0.8 },
   badgeData: { backgroundColor: '#3f2a0f66', borderColor: '#f59e0b' },
-  badgeDataText: { color: '#fbbf24', fontWeight: '700', fontSize: 12, letterSpacing: 0.8 },
+  badgeDataText: { color: '#fbbf24', fontWeight: '700', fontSize: 16, letterSpacing: 0.8 },
   badgeRun: { backgroundColor: '#14532d55', borderColor: GO_COLOR },
-  badgeRunText: { color: GO_COLOR, fontWeight: '700', fontSize: 12 },
+  badgeRunText: { color: GO_COLOR, fontWeight: '700', fontSize: 16 },
   rearStrip: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     justifyContent: 'center',
-    gap: 8,
-    marginBottom: 10,
+    gap: 12,
+    marginBottom: 14,
   },
   rearText: {
-    fontSize: 10,
+    fontSize: 16,
     color: '#9cc6ea',
     fontFamily: MONO,
     borderWidth: 1,
     borderColor: '#1e4d8c55',
-    borderRadius: 3,
-    paddingHorizontal: 6,
+    borderRadius: 4,
+    paddingHorizontal: 8,
     paddingVertical: 3,
     backgroundColor: '#071220',
   },
 
   // ── Main row (display + slider side by side) ──────────────────────────────
   mainRow: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 20,
-    marginBottom: 16,
+    marginBottom: 12,
   },
 
   // ── Display box ───────────────────────────────────────────────────────────
@@ -1397,31 +1487,31 @@ const styles = StyleSheet.create({
     borderColor: BORDER,
     borderRadius: 4,
     paddingVertical: 12,
-    paddingHorizontal: 18,
+    paddingHorizontal: 24,
   },
   displayRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 5,
-    minHeight: 38,
+    paddingVertical: 4,
+    minHeight: 44,
   },
   displayDivider: {
-    height: 1,
+    height: 2,
     backgroundColor: '#1e4d8c66',
-    marginVertical: 1,
+    marginVertical: 4,
   },
   displayLabel: {
-    fontSize: 17,
+    fontSize: 26,
     fontWeight: '600',
     color: '#7ab8e8',
-    width: 120,
+    width: 160,
     fontFamily: MONO,
   },
   displayValue: {
-    fontSize: 22,
+    fontSize: 34,
     fontWeight: '700',
     color: '#e2eaf8',
-    letterSpacing: 3,
+    letterSpacing: 4,
     fontFamily: MONO,
   },
   displayValueDim: {
@@ -1431,27 +1521,27 @@ const styles = StyleSheet.create({
     color: PROG_COLOR,
   },
   timeInput: {
-    fontSize: 22,
+    fontSize: 34,
     fontWeight: '700',
     color: '#e2eaf8',
-    letterSpacing: 3,
+    letterSpacing: 4,
     fontFamily: MONO,
-    minWidth: 72,
-    borderBottomWidth: 2,
+    minWidth: 100,
+    borderBottomWidth: 3,
     borderBottomColor: PROG_COLOR,
-    paddingVertical: 2,
-    paddingHorizontal: 4,
+    paddingVertical: 4,
+    paddingHorizontal: 6,
   },
   displayUnit: {
-    fontSize: 14,
+    fontSize: 22,
     color: '#7ab8e8',
     fontFamily: MONO,
-    marginLeft: 2,
+    marginLeft: 6,
   },
   playIndicator: {
-    fontSize: 16,
+    fontSize: 24,
     color: '#aaa',
-    width: 22,
+    width: 32,
     fontFamily: MONO,
   },
   playIndicatorActive: {
@@ -1461,17 +1551,17 @@ const styles = StyleSheet.create({
   // ── ACQ mode tag ──────────────────────────────────────────────────────────
   modeTag: {
     backgroundColor: '#0f3460',
-    borderWidth: 1.5,
+    borderWidth: 2,
     borderColor: '#2a6abf',
-    borderRadius: 4,
-    paddingHorizontal: 10,
-    paddingVertical: 3,
+    borderRadius: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 6,
   },
   modeTagCPS: { backgroundColor: '#0f2d50', borderColor: '#3a7adf' },
   modeTagCPM: { backgroundColor: '#1a2a50', borderColor: '#5a8adf' },
-  modeTagEditing: { borderColor: PROG_COLOR, borderWidth: 2.5 },
+  modeTagEditing: { borderColor: PROG_COLOR, borderWidth: 3 },
   modeTagText: {
-    fontSize: 16,
+    fontSize: 24,
     fontWeight: '800',
     color: '#c8e0ff',
     letterSpacing: 1,
@@ -1480,26 +1570,26 @@ const styles = StyleSheet.create({
 
   // ── HV Slider ─────────────────────────────────────────────────────────────
   sliderContainer: {
-    width: 150,
+    width: 220,
     alignItems: 'center',
     backgroundColor: '#0c1e3a',
-    borderWidth: 2,
+    borderWidth: 2.5,
     borderColor: BORDER,
-    borderRadius: 6,
+    borderRadius: 8,
     paddingVertical: 12,
-    paddingHorizontal: 8,
+    paddingHorizontal: 12,
   },
   sliderTitle: {
-    fontSize: 11,
+    fontSize: 16,
     fontWeight: '700',
     color: '#7ab8e8',
-    letterSpacing: 0.8,
+    letterSpacing: 1.2,
     textAlign: 'center',
   },
   knobRing: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
+    width: 100,
+    height: 100,
+    borderRadius: 50,
     backgroundColor: '#1a3a6a',
     borderWidth: 4,
     borderColor: '#3a7abf',
@@ -1513,13 +1603,13 @@ const styles = StyleSheet.create({
     elevation: 5,
   },
   knobValue: {
-    fontSize: 22,
+    fontSize: 28,
     fontWeight: '900',
     color: '#e2eaf8',
     fontFamily: MONO,
   },
   knobUnit: {
-    fontSize: 11,
+    fontSize: 18,
     color: '#7ab8e8',
     fontFamily: MONO,
   },
@@ -1531,13 +1621,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
   },
   sliderEdge: {
-    fontSize: 10,
+    fontSize: 14,
     color: '#7ab8e8',
-    fontWeight: '600',
+    fontWeight: '700',
   },
   sliderHint: {
-    marginTop: 4,
-    fontSize: 10,
+    marginTop: 6,
+    fontSize: 12,
     color: '#5a8abf',
     fontStyle: 'italic',
     textAlign: 'center',
@@ -1545,17 +1635,17 @@ const styles = StyleSheet.create({
   hvInput: {
     width: '100%',
     marginTop: 8,
-    borderWidth: 1.5,
+    borderWidth: 2,
     borderColor: '#2a6abf',
-    borderRadius: 6,
+    borderRadius: 8,
     backgroundColor: '#081324',
     color: '#e2eaf8',
     fontFamily: MONO,
-    fontSize: 18,
+    fontSize: 24,
     fontWeight: '700',
     textAlign: 'center',
     paddingVertical: 8,
-    paddingHorizontal: 10,
+    paddingHorizontal: 12,
   },
   hvInputDisabled: {
     backgroundColor: '#1f2937',
@@ -1565,8 +1655,8 @@ const styles = StyleSheet.create({
 
   // ── HV Step toggle ────────────────────────────────────────────────────────
   stepLabel: {
-    marginTop: 10,
-    fontSize: 10,
+    marginTop: 6,
+    fontSize: 14,
     fontWeight: '700',
     color: '#7ab8e8',
     letterSpacing: 0.8,
@@ -1579,7 +1669,7 @@ const styles = StyleSheet.create({
   },
   stepBtn: {
     flex: 1,
-    paddingVertical: 5,
+    paddingVertical: 6,
     borderWidth: 1.5,
     borderColor: '#1e4d8c',
     borderRadius: 4,
@@ -1591,7 +1681,7 @@ const styles = StyleSheet.create({
     borderColor: '#60a5fa',
   },
   stepBtnText: {
-    fontSize: 11,
+    fontSize: 16,
     fontWeight: '700',
     color: '#7ab8e8',
   },
@@ -1602,7 +1692,7 @@ const styles = StyleSheet.create({
   // ── Button grid ───────────────────────────────────────────────────────────
   buttonGrid: {
     width: '100%',
-    gap: 12,
+    gap: 10,
   },
   buttonRow: {
     flexDirection: 'row',
@@ -1611,7 +1701,7 @@ const styles = StyleSheet.create({
   },
   btn: {
     flex: 1,
-    height: 64,
+    height: 70,
     backgroundColor: '#0f2040',
     borderWidth: 2.5,
     borderColor: '#1e4d8c',
@@ -1625,18 +1715,18 @@ const styles = StyleSheet.create({
     elevation: 4,
   },
   btnText: {
-    fontSize: 19,
+    fontSize: 26,
     fontWeight: '800',
     color: TEXT_DARK,
     letterSpacing: 1.4,
   },
   btnArrow: { flex: 0.65 },
-  arrowText: { fontSize: 24, color: '#c8deff', fontWeight: '900' },
+  arrowText: { fontSize: 32, color: '#c8deff', fontWeight: '900' },
 
   btnProgActive: { backgroundColor: '#1a3460', borderColor: PROG_COLOR },
   btnStoreActive: { backgroundColor: '#5b3a10', borderColor: '#f59e0b' },
   btnTextProg: { color: PROG_COLOR },
-  progSubLabel: { fontSize: 12, color: PROG_COLOR, fontWeight: '700' },
+  progSubLabel: { fontSize: 18, color: PROG_COLOR, fontWeight: '700' },
 
   btnSRT: { backgroundColor: '#14532d', borderColor: GO_COLOR },
   btnSRTText: { color: GO_COLOR, fontWeight: '900' },
@@ -1647,8 +1737,8 @@ const styles = StyleSheet.create({
   btnDisabled: { backgroundColor: '#0a1628', borderColor: '#1e3a5f', opacity: 0.45 },
 
   hintText: {
-    marginTop: 12,
-    fontSize: 13,
+    marginTop: 8,
+    fontSize: 18,
     color: '#5a8abf',
     letterSpacing: 0.4,
     fontStyle: 'italic',
@@ -1656,27 +1746,27 @@ const styles = StyleSheet.create({
 
   // ── Preset Time digit-editor UI ────────────────────────────────────────────────
   progEditHeader: {
-    fontSize: 13,
+    fontSize: 24,
     fontWeight: '800',
     color: '#7ab8e8',
     letterSpacing: 2,
     fontFamily: 'monospace',
-    marginBottom: 2,
+    marginBottom: 4,
   },
   progEditRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginVertical: 2,
+    marginVertical: 4,
   },
   progEditLabel: {
-    fontSize: 17,
+    fontSize: 28,
     fontWeight: '700',
     color: '#7ab8e8',
     fontFamily: 'monospace',
-    width: 52,
+    width: 90,
   },
   progEditHv: {
-    fontSize: 20,
+    fontSize: 32,
     fontWeight: '700',
     color: '#e2eaf8',
     letterSpacing: 3,
@@ -1686,17 +1776,17 @@ const styles = StyleSheet.create({
   // Digit cells
   digitRow: {
     flexDirection: 'row',
-    gap: 4,
+    gap: 6,
   },
   digitCell: {
     alignItems: 'center',
-    width: 26,
+    width: 44,
   },
   cursorArrow: {
-    fontSize: 11,
+    fontSize: 20,
     fontWeight: '900',
-    height: 14,
-    lineHeight: 14,
+    height: 20,
+    lineHeight: 20,
   },
   cursorArrowActive: {
     color: '#60a5fa',        // PROG_COLOR
@@ -1705,7 +1795,7 @@ const styles = StyleSheet.create({
     color: 'transparent',
   },
   digitChar: {
-    fontSize: 24,
+    fontSize: 46,
     fontWeight: '900',
     color: '#e2eaf8',
     fontFamily: 'monospace',
@@ -1726,14 +1816,14 @@ const styles = StyleSheet.create({
     paddingVertical: 18,
   },
   overlayLine1: {
-    fontSize: 32,
+    fontSize: 48,
     fontWeight: '900',
     color: '#f59e0b',       // amber — attention
     letterSpacing: 3,
     fontFamily: 'monospace',
   },
   overlayLine2: {
-    fontSize: 20,
+    fontSize: 32,
     fontWeight: '700',
     color: '#fbbf24',
     letterSpacing: 2,
@@ -1741,7 +1831,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   overlayOK: {
-    fontSize: 48,
+    fontSize: 64,
     fontWeight: '900',
     color: '#22c55e',       // bright green
     letterSpacing: 6,
@@ -1752,13 +1842,13 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   overlaySub: {
-    fontSize: 12,
+    fontSize: 22,
     color: '#7ab8e8',
     fontStyle: 'italic',
-    marginTop: 2,
+    marginTop: 6,
   },
   bootIdentity: {
-    fontSize: 30,
+    fontSize: 42,
     fontWeight: '900',
     color: '#f8fafc',
     letterSpacing: 2,
@@ -1769,26 +1859,26 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 0, height: 0 },
   },
   memoryValue: {
-    fontSize: 26,
+    fontSize: 36,
     fontWeight: '900',
     color: '#e2eaf8',
     fontFamily: MONO,
     letterSpacing: 2,
-    marginVertical: 6,
+    marginVertical: 10,
     textAlign: 'center',
   },
 
   // ── Label selector (LABEL_ASSIGN screen) ───────────────────────────────────
   labelSelectRow: {
     flexDirection: 'row',
-    gap: 10,
-    marginVertical: 10,
+    gap: 12,
+    marginVertical: 12,
   },
   labelOption: {
-    width: 52,
-    height: 52,
-    borderRadius: 6,
-    borderWidth: 2,
+    width: 80,
+    height: 80,
+    borderRadius: 8,
+    borderWidth: 3,
     borderColor: '#1e4d8c',
     backgroundColor: '#0a1628',
     alignItems: 'center',
@@ -1804,7 +1894,7 @@ const styles = StyleSheet.create({
     elevation: 6,
   },
   labelOptionText: {
-    fontSize: 18,
+    fontSize: 28,
     fontWeight: '900',
     color: '#5a7abf',
     fontFamily: 'monospace',
@@ -1814,14 +1904,14 @@ const styles = StyleSheet.create({
     color: '#a78bfa',
   },
   labelDesc: {
-    fontSize: 14,
+    fontSize: 22,
     color: '#c084fc',
     fontStyle: 'italic',
     letterSpacing: 0.5,
-    marginBottom: 2,
+    marginBottom: 4,
   },
   iterValueSmall: {
-    fontSize: 24,
+    fontSize: 32,
     fontWeight: '900',
     color: '#cbd5e1',
     fontFamily: MONO,
@@ -1833,4 +1923,70 @@ const styles = StyleSheet.create({
     textShadowRadius: 8,
     textShadowOffset: { width: 0, height: 0 },
   },
+
+  // ── Recall Table & Erase Button ─────────────────────────────────────────
+  eraseBtn: {
+    backgroundColor: '#991b1b',
+    borderWidth: 2,
+    borderColor: '#ef4444',
+    borderRadius: 6,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    marginVertical: 16,
+    elevation: 4,
+  },
+  eraseBtnText: {
+    color: '#fef2f2',
+    fontSize: 26,
+    fontWeight: '900',
+    letterSpacing: 2,
+    fontFamily: MONO,
+  },
+  iterTableContainer: {
+    width: 280,
+    marginTop: 10,
+    marginBottom: 10,
+    backgroundColor: '#050d1a',
+  },
+  iterTableHeader: {
+    flexDirection: 'row',
+    backgroundColor: '#1e3a6a',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+  iterTableColHeader: {
+    flex: 1,
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#9cc6ea',
+    textAlign: 'center',
+    fontFamily: MONO,
+  },
+  iterTableRow: {
+    flexDirection: 'row',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+  iterTableCol1: {
+    flex: 1,
+    fontSize: 20,
+    color: '#7ab8e8',
+    textAlign: 'center',
+    fontFamily: MONO,
+  },
+  iterTableCol2: {
+    flex: 1,
+    fontSize: 20,
+    color: '#e2eaf8',
+    fontWeight: '700',
+    textAlign: 'center',
+    fontFamily: MONO,
+    letterSpacing: 2,
+  },
+  recallHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 });
+
