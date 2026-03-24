@@ -23,13 +23,18 @@ import {
   TouchableOpacity,
   StyleSheet,
   Alert,
+  Platform,
   StatusBar,
   SafeAreaView,
   Image,
   ScrollView,
 } from 'react-native';
+import * as SQLite from 'expo-sqlite';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
+const DATABASE_NAME = 'NP.db';
 const HV_MIN = 0;
 const HV_MAX = 1200;
 const DEFAULT_HV = 400;
@@ -180,6 +185,47 @@ function GMCountingScreen() {
   const windowCountsRef = useRef(0);  // accumulator for current CPS/CPM window
   const windowElapsedRef = useRef(0);  // seconds elapsed within current window
 
+  // ── Database Initialization ───────────────────────────────────────────────
+  useEffect(() => {
+    try {
+      const db = SQLite.openDatabaseSync(DATABASE_NAME);
+      db.execSync(`
+        CREATE TABLE IF NOT EXISTS measurements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          serialNo INTEGER,
+          value INTEGER,
+          acqMode TEXT,
+          presetTime INTEGER,
+          numberOfReadings INTEGER,
+          label TEXT,
+          iterations INTEGER,
+          dHv INTEGER,
+          iterationResults TEXT,
+          hv INTEGER,
+          storeDataMode TEXT,
+          outputRoute TEXT,
+          detectorInput TEXT,
+          powerInput TEXT,
+          timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      const rows = db.getAllSync('SELECT * FROM measurements ORDER BY serialNo ASC');
+      if (rows && rows.length > 0) {
+        const parsedRows = rows.map((r) => ({
+          ...r,
+          iterationResults: r.iterationResults ? JSON.parse(r.iterationResults) : [],
+        }));
+        setStoredReadings(parsedRows);
+        const maxSerial = parsedRows[parsedRows.length - 1].serialNo;
+        nextSerialNoRef.current = maxSerial + 1;
+        setRecallIndex(parsedRows.length - 1);
+      }
+    } catch (err) {
+      console.error('Failed to initialize local GM Database:', err);
+    }
+  }, []);
+
   useEffect(() => {
     const geigerTimer = setTimeout(() => setBootStage(BOOT_NUCLEONIX), 3000);
     const readyTimer = setTimeout(() => setBootStage(BOOT_READY), 6000);
@@ -277,6 +323,28 @@ function GMCountingScreen() {
       ...measurement,
       serialNo: nextSerialNoRef.current,
     };
+
+    try {
+      const db = SQLite.openDatabaseSync(DATABASE_NAME);
+      db.runSync(`
+        INSERT INTO measurements (
+          serialNo, value, acqMode, presetTime, numberOfReadings,
+          label, iterations, dHv, iterationResults, hv,
+          storeDataMode, outputRoute, detectorInput, powerInput
+        ) VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?
+        )`,
+        [
+          entry.serialNo, entry.value, entry.acqMode, entry.presetTime, entry.numberOfReadings,
+          entry.label, entry.iterations, entry.dHv, JSON.stringify(entry.iterationResults || []), entry.hv,
+          entry.storeDataMode, entry.outputRoute, entry.detectorInput, entry.powerInput
+        ]
+      );
+    } catch (err) {
+      console.error('Failed to store reading into Database:', err);
+    }
 
     nextSerialNoRef.current += 1;
     setStoredReadings((prev) => [...prev, entry]);
@@ -679,11 +747,69 @@ function GMCountingScreen() {
 
   const handleEraseData = () => {
     if (dataMode !== DATA_ERASE_CONFIRM) return;
+
+    try {
+      const db = SQLite.openDatabaseSync(DATABASE_NAME);
+      db.runSync('DELETE FROM measurements');
+      db.runSync("DELETE FROM sqlite_sequence WHERE name='measurements';");
+    } catch (err) {
+      console.error('Error erasing database:', err);
+    }
+
     setStoredReadings([]);
     setPendingMeasurement(null);
     setRecallIndex(-1);
     nextSerialNoRef.current = 1;
     showDataMessage('MEMORY CLEARED');
+  };
+
+  const handleExportDB = async () => {
+    try {
+      const dbFileUri = `${FileSystem.documentDirectory}SQLite/${DATABASE_NAME}`;
+      const fileInfo = await FileSystem.getInfoAsync(dbFileUri);
+      
+      if (!fileInfo.exists) {
+        Alert.alert("Export Error", "No database found. Save some data first!");
+        return;
+      }
+
+      if (Platform.OS === 'android') {
+        const permission = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(
+          'content://com.android.externalstorage.documents/tree/primary%3ADownload'
+        );
+
+        if (permission.granted && permission.directoryUri) {
+          const targetFileUri = await FileSystem.StorageAccessFramework.createFileAsync(
+            permission.directoryUri,
+            DATABASE_NAME,
+            'application/x-sqlite3'
+          );
+          const dbBase64 = await FileSystem.readAsStringAsync(dbFileUri, {
+            encoding: FileSystem.EncodingType.Base64,
+          });
+          await FileSystem.writeAsStringAsync(targetFileUri, dbBase64, {
+            encoding: FileSystem.EncodingType.Base64,
+          });
+
+          Alert.alert('Export Complete', `${DATABASE_NAME} saved to selected folder.`);
+          return;
+        }
+      }
+      
+      const canShare = await Sharing.isAvailableAsync();
+      if (canShare) {
+        await Sharing.shareAsync(dbFileUri, {
+          mimeType: 'application/x-sqlite3',
+          dialogTitle: 'Export GM Database',
+          UTI: 'public.database'
+        });
+      } else {
+        Alert.alert("Export Error", "Sharing is not available on this device.");
+      }
+    } catch (err) {
+      console.error("Export DB Error:", err);
+      Alert.alert("Export Failed", err.message);
+    }
   };
 
   // ── Derived display values ────────────────────────────────────────────────
@@ -822,8 +948,17 @@ function GMCountingScreen() {
                 <Text style={styles.overlayLine1}>DATA OUT</Text>
                 <Text style={styles.overlayLine2}>REAR PANEL</Text>
                 <Text style={styles.memoryValue}>{OUTPUT_ROUTE_LABELS[outputRoute]}</Text>
-                <Text style={styles.overlaySub}>USB serial cable for PC</Text>
-                <Text style={styles.overlaySub}>Optional 25-pin D-connector printer output</Text>
+                
+                <TouchableOpacity 
+                  style={{ marginTop: 12, marginBottom: 8, backgroundColor: '#7c6cc4', paddingVertical: 10, paddingHorizontal: 24, borderRadius: 8 }}
+                  onPress={handleExportDB}
+                  activeOpacity={0.7}
+                >
+                  <Text style={{ color: '#ffffff', fontSize: 18, fontWeight: 'bold' }}>📤 EXPORT DB FILE</Text>
+                </TouchableOpacity>
+
+                <Text style={styles.overlaySub}>Tap button to extract SQLite file to File Explorer</Text>
+                <Text style={styles.overlaySub}>▲ or ▼ to change hardware route</Text>
               </View>
             )}
 
