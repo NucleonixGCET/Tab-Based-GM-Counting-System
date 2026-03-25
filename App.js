@@ -59,8 +59,7 @@ const PROG_READINGS_ADJUST = 'READINGS_ADJUST'; // ③ ▲ increment digit · �
 const PROG_LABEL_ASSIGN = 'LABEL_ASSIGN';    // ④ ▲/▼ cycle label: SP → ST → BG
 const PROG_ITERATION_ADJUST = 'ITERATION_ADJUST'; // ⑤ ▲/▼ set iteration count (1–9)
 const PROG_DHV_ADJUST = 'DHV_ADJUST';       // ⑥ ▲/▼ set delta HV
-const PROG_HV_ADJUST = 'HV_ADJUST';       // ⑦ ▲/▼ adjust HV by current slider step
-const PROG_SAVE_CONFIRM = 'SAVE_CONFIRM';      // ⑧ press ▲/▼ to save · PROG to discard
+const PROG_SAVE_CONFIRM = 'SAVE_CONFIRM';      // ⑦ press ▲/▼ to save · PROG to discard
 const PROG_SHOW_OK = 'SHOW_OK';           // transient 1-second OK flash
 
 const BOOT_GEIGER = 'BOOT_GEIGER';
@@ -129,6 +128,19 @@ export default function App() {
 function GMCountingScreen() {
   const { hv, setHv } = useContext(GMContext);
   const [hvStep, setHvStep] = useState(30); // HV jump: 30 V or 50 V
+  const [refHv, setRefHv] = useState(0);
+  const refHvRef = useRef(0);
+
+  useEffect(() => {
+    const iv = setInterval(() => {
+      // Simulate live hardware analogue voltage returns
+      const activeHv = Math.max(0, hv + Math.floor((Math.random() - 0.5) * 6));
+      setRefHv(activeHv);
+      refHvRef.current = activeHv;
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [hv]);
+
   const [bootStage, setBootStage] = useState(BOOT_GEIGER);
   const [dataMode, setDataMode] = useState(DATA_OFF);
   const [storeDataMode, setStoreDataMode] = useState(STORE_MODE_AUTO);
@@ -357,7 +369,7 @@ function GMCountingScreen() {
     const measurement = {
       value,
       acqMode,
-      presetTime,
+      presetTime: (acqMode === 'CPS' || acqMode === 'CPM') ? elapsedTime : presetTime,
       numberOfReadings: storedReadings.length,
       label,
       iterations,
@@ -423,7 +435,7 @@ function GMCountingScreen() {
             clearInterval(intervalRef.current);
             // Store this cycle's count
             setCounts((finalCount) => {
-              iterationResultsRef.current.push({ count: finalCount, hv: hv });
+              iterationResultsRef.current.push({ count: finalCount, refHv: refHvRef.current });
               const doneCount = iterationResultsRef.current.length;
               if (doneCount < iterations) {
                 // More iterations to go — auto-restart after a brief pause
@@ -458,6 +470,10 @@ function GMCountingScreen() {
         windowCountsRef.current += tick;
         const cpsValue = windowCountsRef.current;
         setDisplayedCounts(cpsValue);   // update display every second
+        
+        // Push the active CPS into the history array for RECALL
+        iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpsValue, refHv: refHvRef.current });
+        
         windowCountsRef.current = 0;    // reset for next second
         setElapsedTime((t) => t + 1);
 
@@ -468,7 +484,12 @@ function GMCountingScreen() {
         setElapsedTime((t) => t + 1);
 
         if (windowElapsedRef.current >= 60) {
-          setDisplayedCounts(windowCountsRef.current); // snapshot completed minute
+          const cpmValue = windowCountsRef.current;
+          setDisplayedCounts(cpmValue); // snapshot completed minute
+          
+          // Push active CPM into the history array
+          iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpmValue, refHv: refHvRef.current });
+          
           windowCountsRef.current = 0;               // reset
           windowElapsedRef.current = 0;
         }
@@ -500,11 +521,16 @@ function GMCountingScreen() {
       return;
     }
 
-    // From ACQ_SELECT, move to TIME_ADJUST
+    // From ACQ_SELECT, move to TIME_ADJUST or skip for CPS/CPM
     if (progSub === PROG_ACQ_SELECT) {
-      setCursorPos(0);
-      setProgSub(PROG_TIME_ADJUST);
-      setActiveParamField(PARAM_FIELD_TIMER);
+      if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') {
+        setProgSub(PROG_READINGS_ADJUST);
+        setActiveParamField(PARAM_FIELD_READINGS);
+      } else {
+        setCursorPos(0);
+        setProgSub(PROG_TIME_ADJUST);
+        setActiveParamField(PARAM_FIELD_TIMER);
+      }
       return;
     }
 
@@ -522,10 +548,14 @@ function GMCountingScreen() {
       return;
     }
 
-    // From LABEL_ASSIGN, cycle to ITERATION_ADJUST
+    // From LABEL_ASSIGN, cycle to ITERATION_ADJUST or skip for CPS/CPM
     if (progSub === PROG_LABEL_ASSIGN) {
-      setProgSub(PROG_ITERATION_ADJUST);
-      setActiveParamField(PARAM_FIELD_ITERATIONS);
+      if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') {
+        setProgSub(PROG_SAVE_CONFIRM);
+      } else {
+        setProgSub(PROG_ITERATION_ADJUST);
+        setActiveParamField(PARAM_FIELD_ITERATIONS);
+      }
       return;
     }
 
@@ -536,14 +566,8 @@ function GMCountingScreen() {
       return;
     }
 
-    // From DHV_ADJUST, move to HV_ADJUST
+    // From DHV_ADJUST, move to SAVE_CONFIRM
     if (progSub === PROG_DHV_ADJUST) {
-      setProgSub(PROG_HV_ADJUST);
-      return;
-    }
-
-    // From HV_ADJUST, move to SAVE_CONFIRM
-    if (progSub === PROG_HV_ADJUST) {
       setProgSub(PROG_SAVE_CONFIRM);
       return;
     }
@@ -613,10 +637,6 @@ function GMCountingScreen() {
       // ▲ → increment dHV by 5 (max 100)
       setDraftDHv((v) => Math.min(v + 5, 100));
 
-    } else if (progSub === PROG_HV_ADJUST) {
-      // ▲ → increase HV by the current slider step
-      setHv((v) => Math.min(v + hvStep, HV_MAX));
-
     } else if (progSub === PROG_SAVE_CONFIRM) {
       commitProgrammingSession();
     }
@@ -676,10 +696,6 @@ function GMCountingScreen() {
       // ▼ → decrement dHV by 5 (min 0)
       setDraftDHv((v) => Math.max(v - 5, 0));
 
-    } else if (progSub === PROG_HV_ADJUST) {
-      // ▼ → decrease HV by the current slider step
-      setHv((v) => Math.max(v - hvStep, HV_MIN));
-
     } else if (progSub === PROG_SAVE_CONFIRM) {
       commitProgrammingSession();
     }
@@ -707,6 +723,12 @@ function GMCountingScreen() {
   const handleSTP = () => {
     clearInterval(intervalRef.current);
     setIsRunning(false);
+
+    // Continuous modes don't have a natural termination point to stage measurements automatically.
+    // Hitting STP serves as the manual snapshot point for CPS/CPM.
+    if (acqMode === 'CPS' || acqMode === 'CPM') {
+      queueMeasurement(displayedCounts);
+    }
   };
 
   // ── STORE ─────────────────────────────────────────────────────────────────
@@ -838,7 +860,7 @@ function GMCountingScreen() {
 
   const formatCounts = (n) => String(n).padStart(6, '0');
   const formatPRTime = (n) => String(n).padStart(4, '0');
-  const formatHV = (n) => String(n).padStart(4, ' ');
+  const formatHV = (n) => typeof n === 'number' ? String(n).padStart(4, '0') : '----';
 
   // ── PROG cycle label helpers ──────────────────────────────────────────────
   const progLabel =
@@ -853,9 +875,8 @@ function GMCountingScreen() {
                     : progSub === PROG_READINGS_ADJUST ? 'READINGS shows total MEM count (read-only)'
                       : progSub === PROG_LABEL_ASSIGN ? '▲ / ▼  →  Cycle label  [SP · ST · BG]'
                         : progSub === PROG_ITERATION_ADJUST ? '▲/▼ set iterations (1-9)'
-                          : progSub === PROG_HV_ADJUST ? `▲/▼ adjust HV by ${hvStep} V step`
-                            : progSub === PROG_SAVE_CONFIRM ? 'Press ▲ or ▼ to SAVE  ·  Press PROG to discard'
-                              : progSub === PROG_SHOW_OK ? 'Settings saved!'
+                          : progSub === PROG_SAVE_CONFIRM ? 'Press ▲ or ▼ to SAVE  ·  Press PROG to discard'
+                            : progSub === PROG_SHOW_OK ? 'Settings saved!'
                                 : storeDataMode === STORE_MODE_MANUAL
                                   ? 'STORE saves pending reading  ·  Long press STORE for memory menu'
                                   : 'Press PROG to enter programming mode  ·  Long press STORE for memory menu';
@@ -887,9 +908,8 @@ function GMCountingScreen() {
                     : progSub === PROG_READINGS_ADJUST ? 'READINGS'
                       : progSub === PROG_LABEL_ASSIGN ? 'LABEL'
                         : progSub === PROG_ITERATION_ADJUST ? 'ITERATIONS'
-                          : progSub === PROG_HV_ADJUST ? 'HV ADJUST'
-                            : progSub === PROG_SAVE_CONFIRM ? 'SAVE?'
-                              : 'SAVED ✓'}
+                          : progSub === PROG_SAVE_CONFIRM ? 'SAVE?'
+                            : 'SAVED ✓'}
               </Text>
             </View>
           )}
@@ -983,12 +1003,12 @@ function GMCountingScreen() {
                         <View style={styles.iterTableContainer}>
                             <View style={styles.iterTableHeader}>
                               <Text style={styles.iterTableColHeader}>Run</Text>
-                              <Text style={styles.iterTableColHeader}>HV (V)</Text>
+                              <Text style={styles.iterTableColHeader}>Ref HV (V)</Text>
                               <Text style={styles.iterTableColHeader}>Count</Text>
                             </View>
                             {currentRecallEntry.iterationResults.map((item, idx) => {
                               const val = typeof item === 'object' ? item.count : item;
-                              const stepHv = typeof item === 'object' ? item.hv : currentRecallEntry.hv;
+                              const stepHv = typeof item === 'object' ? (item.refHv || item.hv || currentRecallEntry.hv) : currentRecallEntry.hv;
 
                               return (
                                 <View key={idx} style={styles.iterTableRow}>
@@ -999,6 +1019,33 @@ function GMCountingScreen() {
                               );
                             })}
                         </View>
+                      )}
+
+                      {(currentRecallEntry.acqMode === 'CPS' || currentRecallEntry.acqMode === 'CPM') && (
+                        <>
+                          <Text style={[styles.overlaySub, { fontSize: 18, marginBottom: 8, color: '#fb923c' }]}>
+                            Duration: {currentRecallEntry.acqMode === 'CPS' 
+                              ? `${currentRecallEntry.presetTime} seconds` 
+                              : `${Math.floor(currentRecallEntry.presetTime / 60)} minutes ${currentRecallEntry.presetTime % 60} seconds`}
+                          </Text>
+
+                          {currentRecallEntry.iterationResults && currentRecallEntry.iterationResults.length > 0 && (
+                            <View style={[styles.iterTableContainer, { marginTop: 4 }]}>
+                                <View style={styles.iterTableHeader}>
+                                  <Text style={styles.iterTableColHeader}>{currentRecallEntry.acqMode === 'CPS' ? 'Second' : 'Minute'}</Text>
+                                  <Text style={styles.iterTableColHeader}>Ref HV</Text>
+                                  <Text style={styles.iterTableColHeader}>Count</Text>
+                                </View>
+                                {currentRecallEntry.iterationResults.map((item, idx) => (
+                                    <View key={idx} style={styles.iterTableRow}>
+                                      <Text style={styles.iterTableCol1}>{item.timeUnit}</Text>
+                                      <Text style={[styles.iterTableCol1, { color: '#fb923c' }]}>{item.refHv || '----'}</Text>
+                                      <Text style={styles.iterTableCol2}>{String(item.count).padStart(6, '0')}</Text>
+                                    </View>
+                                ))}
+                            </View>
+                          )}
+                        </>
                       )}
                     </>
                   ) : (
@@ -1033,7 +1080,7 @@ function GMCountingScreen() {
                 <Text style={styles.overlayLine2}>(PRG)</Text>
                 <Text style={styles.overlaySub}>{ACQ_LABELS[draftAcqMode]}</Text>
                 <Text style={styles.overlaySub}>T {formatPRTime(draftPresetTime)} s  ·  R {formatPRTime(draftNumberOfReadings)}</Text>
-                <Text style={styles.overlaySub}>L {draftLabel}  ·  I {draftIterations}  ·  HV {formatHV(hv)} V</Text>
+                <Text style={styles.overlaySub}>L {draftLabel}  ·  I {draftIterations}</Text>
                 <Text style={styles.overlaySub}>▲ or ▼  →  Confirm Save</Text>
                 <Text style={styles.overlaySub}>PROG  {'→'}  Discard {'&'} Exit</Text>
               </View>
@@ -1044,7 +1091,6 @@ function GMCountingScreen() {
               <View style={styles.overlayScreen}>
                 <Text style={styles.overlayOK}>OK</Text>
                 <Text style={styles.overlaySub}>Settings saved!</Text>
-                <Text style={styles.overlaySub}>HV {formatHV(hv)} V</Text>
               </View>
             )}
 
@@ -1055,11 +1101,6 @@ function GMCountingScreen() {
                 <View style={styles.progEditRow}>
                   <Text style={styles.progEditLabel}>REAIN</Text>
                   <Text style={styles.progEditHv}>{formatPRTime(memoryCount)}</Text>
-                </View>
-                <View style={styles.progEditRow}>
-                  <Text style={styles.progEditLabel}>HV   </Text>
-                  <Text style={styles.progEditHv}>{formatHV(hv)}</Text>
-                  <Text style={styles.displayUnit}> V</Text>
                 </View>
                 <Text style={styles.overlaySub}>MEM count is read-only</Text>
               </View>
@@ -1083,11 +1124,6 @@ function GMCountingScreen() {
                   ))}
                 </View>
                 <Text style={styles.labelDesc}>{LABEL_NAMES[draftLabel]}</Text>
-                <View style={styles.progEditRow}>
-                  <Text style={[styles.progEditLabel, { marginTop: 8 }]}>HV   </Text>
-                  <Text style={[styles.progEditHv, { marginTop: 8 }]}>{formatHV(hv)}</Text>
-                  <Text style={[styles.displayUnit, { marginTop: 8 }]}> V</Text>
-                </View>
                 <Text style={styles.overlaySub}>▲ forward  ·  ▼ backward</Text>
               </View>
             )}
@@ -1102,24 +1138,7 @@ function GMCountingScreen() {
                 <Text style={[styles.labelDesc, { marginTop: 4 }]}>
                   {draftIterations === 1 ? 'Single run' : `Run ×${draftIterations}, display average`}
                 </Text>
-                <View style={styles.iterBoxRow}>
-                  <Text style={styles.progEditLabel}>HV</Text>
-                  <Text style={styles.iterValueSmall}>
-                    {formatHV(hv)} V
-                  </Text>
-                </View>
                 <Text style={styles.overlaySub}>HV is independent and controlled by helipot slider</Text>
-              </View>
-            )}
-
-            {!isBooting && dataMode === DATA_OFF && progSub === PROG_HV_ADJUST && (
-              <View style={styles.overlayScreen}>
-                <Text style={styles.progEditHeader}>HV ADJUST</Text>
-                <View style={styles.iterBoxRow}>
-                  <Text style={[styles.iterValueSmall, styles.iterValueActive]}>{formatHV(hv)} V</Text>
-                </View>
-                <Text style={styles.overlaySub}>▲/▼ changes HV in steps of {hvStep} V</Text>
-                <Text style={styles.overlaySub}>CW/right slider also increases HV</Text>
               </View>
             )}
 
@@ -1130,8 +1149,7 @@ function GMCountingScreen() {
               && progSub !== PROG_SHOW_OK
               && progSub !== PROG_READINGS_ADJUST
               && progSub !== PROG_LABEL_ASSIGN
-              && progSub !== PROG_ITERATION_ADJUST
-              && progSub !== PROG_HV_ADJUST && (
+              && progSub !== PROG_ITERATION_ADJUST && (
                 <>
                   {/* === LINE 1: Count/AVG (always visible) === */}
                   <View style={styles.displayRow}>
@@ -1326,9 +1344,9 @@ function GMCountingScreen() {
                       styles.playIndicator,
                       isRunning && styles.playIndicatorActive,
                     ]}>▶</Text>
-                    <Text style={styles.displayLabel}>HV :</Text>
+                    <Text style={styles.displayLabel}>Ref HV :</Text>
                     <Text style={styles.displayValue}>
-                      {formatHV(hv)}
+                      ----
                     </Text>
                     <Text style={styles.displayUnit}> V</Text>
                   </View>
@@ -1359,9 +1377,8 @@ function GMCountingScreen() {
                         : progSub === PROG_LABEL_ASSIGN ? '④'
                           : progSub === PROG_ITERATION_ADJUST ? '⑤'
                             : progSub === PROG_DHV_ADJUST ? '⑥'
-                              : progSub === PROG_HV_ADJUST ? '⑦'
-                                : progSub === PROG_SAVE_CONFIRM ? '⑧'
-                                  : '✓'}
+                              : progSub === PROG_SAVE_CONFIRM ? '⑦'
+                                : '✓'}
                 </Text>
               )}
             </TouchableOpacity>
@@ -1451,7 +1468,7 @@ function HVSlider({ hv, setHv, disabled, hvStep, setHvStep }) {
 
   return (
     <View style={styles.sliderContainer}>
-      <Text style={styles.sliderTitle}>HIGH VOLTAGE</Text>
+      <Text style={styles.sliderTitle}>SET HV</Text>
       <Text style={styles.sliderTitle}>CONTROL</Text>
 
       {/* Knob label */}
@@ -1479,32 +1496,20 @@ function HVSlider({ hv, setHv, disabled, hvStep, setHvStep }) {
       </View>
 
       {/* ── HV jump controls ───────────────────────────────── */}
-      <Text style={styles.stepLabel}>HV JUMP</Text>
+      <Text style={styles.stepLabel}>SETTING</Text>
       <View style={styles.stepRow}>
-        {[30, 50].map((val) => (
-          <TouchableOpacity
-            key={val}
-            style={[
-              styles.stepBtn,
-              hvStep === val && styles.stepBtnActive,
-            ]}
-            onPress={() => {
-              setHvStep(val);
-              jumpHv(val);
-            }}
-            disabled={disabled}
-            activeOpacity={0.7}
-          >
-            <Text style={[
-              styles.stepBtnText,
-              hvStep === val && styles.stepBtnTextActive,
-            ]}>+{val} V</Text>
-          </TouchableOpacity>
-        ))}
+        <TouchableOpacity
+          style={styles.stepBtn}
+          onPress={applyHvInput}
+          disabled={disabled}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.stepBtnText}>SET HV</Text>
+        </TouchableOpacity>
       </View>
 
       <Text style={styles.sliderHint}>
-        {disabled ? 'HV locked during boot/count/program/data' : `Step: ±${hvStep} V`}
+        {disabled ? 'HV locked during boot/count/program/data' : `Apply typed HV value`}
       </Text>
     </View>
   );
