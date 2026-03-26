@@ -150,6 +150,7 @@ function GMCountingScreen() {
   const [pendingMeasurement, setPendingMeasurement] = useState(null);
   const [dataMessage, setDataMessage] = useState('');
   const nextSerialNoRef = useRef(1);
+  const dbRef = useRef(null);
   const dataModeTimeoutRef = useRef(null);
   const rearPanelConfigRef = useRef({
     detectorInput: 'MHV SOCKET',
@@ -194,13 +195,16 @@ function GMCountingScreen() {
   const [iterationRestartToken, setIterationRestartToken] = useState(0);
 
   const intervalRef = useRef(null);
-  const windowCountsRef = useRef(0);  // accumulator for current CPS/CPM window
+  const windowCountsRef = useRef(0);   // accumulator for current CPS/CPM window
   const windowElapsedRef = useRef(0);  // seconds elapsed within current window
+  const displayedCountsRef = useRef(0); // mirror of displayedCounts — always live
+  const elapsedTimeRef = useRef(0);     // mirror of elapsedTime — always live
 
   // ── Database Initialization ───────────────────────────────────────────────
   useEffect(() => {
     try {
       const db = SQLite.openDatabaseSync(DATABASE_NAME);
+      dbRef.current = db;
       db.execSync(`
         CREATE TABLE IF NOT EXISTS measurements (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -221,6 +225,22 @@ function GMCountingScreen() {
           timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         );
       `);
+
+      // Schema migrations — add any column that may be missing from older on-device tables.
+      // SQLite has no "ADD COLUMN IF NOT EXISTS", so each ALTER TABLE is wrapped in its own
+      // try/catch; the error thrown when a column already exists is silently ignored.
+      const migrateColumns = [
+        'ALTER TABLE measurements ADD COLUMN serialNo INTEGER;',
+        'ALTER TABLE measurements ADD COLUMN iterationResults TEXT;',
+        'ALTER TABLE measurements ADD COLUMN hv INTEGER;',
+        'ALTER TABLE measurements ADD COLUMN storeDataMode TEXT;',
+        'ALTER TABLE measurements ADD COLUMN outputRoute TEXT;',
+        'ALTER TABLE measurements ADD COLUMN detectorInput TEXT;',
+        'ALTER TABLE measurements ADD COLUMN powerInput TEXT;',
+      ];
+      for (const sql of migrateColumns) {
+        try { db.execSync(sql); } catch (_) { /* column already exists */ }
+      }
 
       const rows = db.getAllSync('SELECT * FROM measurements ORDER BY serialNo ASC');
       if (rows && rows.length > 0) {
@@ -337,7 +357,8 @@ function GMCountingScreen() {
     };
 
     try {
-      const db = SQLite.openDatabaseSync(DATABASE_NAME);
+      const db = dbRef.current;
+      if (!db) throw new Error('Database not initialized');
       db.runSync(`
         INSERT INTO measurements (
           serialNo, value, acqMode, presetTime, numberOfReadings,
@@ -369,7 +390,7 @@ function GMCountingScreen() {
     const measurement = {
       value,
       acqMode,
-      presetTime: (acqMode === 'CPS' || acqMode === 'CPM') ? elapsedTime : presetTime,
+      presetTime: (acqMode === 'CPS' || acqMode === 'CPM') ? elapsedTimeRef.current : presetTime,
       numberOfReadings: storedReadings.length,
       label,
       iterations,
@@ -441,6 +462,7 @@ function GMCountingScreen() {
                 // More iterations to go — auto-restart after a brief pause
                 setTimeout(() => {
                   setCounts(0);
+                  elapsedTimeRef.current = 0;
                   setElapsedTime(0);
                   setCurrentIteration(doneCount + 1);
                   if (dHv > 0) {
@@ -453,6 +475,7 @@ function GMCountingScreen() {
                 const total = iterationResultsRef.current.reduce((a, b) => a + b.count, 0);
                 const avg = Math.round(total / doneCount);
                 const completedValue = doneCount > 1 ? avg : finalCount;
+                displayedCountsRef.current = avg;
                 setDisplayedCounts(avg);
                 setCurrentIteration(0);
                 setIsRunning(false);
@@ -469,22 +492,26 @@ function GMCountingScreen() {
         // ── CPS: show count for every individual second, reset each second ─
         windowCountsRef.current += tick;
         const cpsValue = windowCountsRef.current;
+        displayedCountsRef.current = cpsValue;
         setDisplayedCounts(cpsValue);   // update display every second
         
         // Push the active CPS into the history array for RECALL
         iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpsValue, refHv: refHvRef.current });
         
         windowCountsRef.current = 0;    // reset for next second
+        elapsedTimeRef.current += 1;
         setElapsedTime((t) => t + 1);
 
       } else if (acqMode === 'CPM') {
         // ── CPM: accumulate for 60 s, snapshot, reset, repeat ─────────────
         windowCountsRef.current += tick;
         windowElapsedRef.current += 1;
+        elapsedTimeRef.current += 1;
         setElapsedTime((t) => t + 1);
 
         if (windowElapsedRef.current >= 60) {
           const cpmValue = windowCountsRef.current;
+          displayedCountsRef.current = cpmValue;
           setDisplayedCounts(cpmValue); // snapshot completed minute
           
           // Push active CPM into the history array
@@ -709,7 +736,9 @@ function GMCountingScreen() {
       return;
     }
     setCounts(0);
+    displayedCountsRef.current = 0;
     setDisplayedCounts(0);
+    elapsedTimeRef.current = 0;
     setElapsedTime(0);
     windowCountsRef.current = 0;
     windowElapsedRef.current = 0;
@@ -727,7 +756,7 @@ function GMCountingScreen() {
     // Continuous modes don't have a natural termination point to stage measurements automatically.
     // Hitting STP serves as the manual snapshot point for CPS/CPM.
     if (acqMode === 'CPS' || acqMode === 'CPM') {
-      queueMeasurement(displayedCounts);
+      queueMeasurement(displayedCountsRef.current);
     }
   };
 
@@ -771,7 +800,8 @@ function GMCountingScreen() {
     if (dataMode !== DATA_ERASE_CONFIRM) return;
 
     try {
-      const db = SQLite.openDatabaseSync(DATABASE_NAME);
+      const db = dbRef.current;
+      if (!db) throw new Error('Database not initialized');
       db.runSync('DELETE FROM measurements');
       db.runSync("DELETE FROM sqlite_sequence WHERE name='measurements';");
     } catch (err) {
@@ -787,6 +817,17 @@ function GMCountingScreen() {
 
   const handleExportDB = async () => {
     try {
+      // Flush all pending WAL (Write-Ahead Log) data into the main .db file before
+      // copying it. Without this, recent writes that haven't been checkpointed yet
+      // won't appear in the exported file.
+      if (dbRef.current) {
+        try {
+          dbRef.current.execSync('PRAGMA wal_checkpoint(TRUNCATE);');
+        } catch (e) {
+          console.warn('WAL checkpoint warning:', e);
+        }
+      }
+
       const dbFileUri = `${FileSystem.documentDirectory}SQLite/${DATABASE_NAME}`;
       const fileInfo = await FileSystem.getInfoAsync(dbFileUri);
       
@@ -801,6 +842,21 @@ function GMCountingScreen() {
         );
 
         if (permission.granted && permission.directoryUri) {
+          // Delete any existing NP.db in the chosen folder so we always overwrite,
+          // rather than letting SAF auto-suffix it to "NP.db (1)", "NP.db (2)", etc.
+          try {
+            const existingFiles = await FileSystem.StorageAccessFramework.readDirectoryAsync(
+              permission.directoryUri
+            );
+            for (const fileUri of existingFiles) {
+              if (fileUri.endsWith(encodeURIComponent(DATABASE_NAME)) || fileUri.endsWith(DATABASE_NAME)) {
+                await FileSystem.deleteAsync(fileUri, { idempotent: true });
+              }
+            }
+          } catch (_) {
+            // Non-fatal — if we can't list/delete, we still attempt the write.
+          }
+
           const targetFileUri = await FileSystem.StorageAccessFramework.createFileAsync(
             permission.directoryUri,
             DATABASE_NAME,
