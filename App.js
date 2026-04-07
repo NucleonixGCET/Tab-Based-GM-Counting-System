@@ -32,6 +32,8 @@ import {
 import * as SQLite from 'expo-sqlite';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
+import { useBleDetector } from './hooks/useBleDetector';
+import BleConnectionScreen from './screens/BleConnectionScreen';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 const DATABASE_NAME = 'NP.db';
@@ -108,8 +110,25 @@ export const GMContext = createContext(null);
 
 function GMProvider({ children }) {
   const [hv, setHv] = useState(DEFAULT_HV);
+  const [screen, setScreen] = useState('connect'); // 'connect' | 'main'
+
+  // Callback ref: GMCountingScreen registers here to receive live BLE counts
+  const countCallbackRef = useRef(null);
+
+  // Single BLE manager lives here — survives screen transitions
+  const ble = useBleDetector({
+    onCountReceived: (count) => {
+      countCallbackRef.current?.(count);
+    },
+  });
+
+  // Auto-navigate to main when detector connects
+  useEffect(() => {
+    if (ble.isConnected) setScreen('main');
+  }, [ble.isConnected]);
+
   return (
-    <GMContext.Provider value={{ hv, setHv }}>
+    <GMContext.Provider value={{ hv, setHv, ble, screen, setScreen, countCallbackRef }}>
       {children}
     </GMContext.Provider>
   );
@@ -119,9 +138,15 @@ function GMProvider({ children }) {
 export default function App() {
   return (
     <GMProvider>
-      <GMCountingScreen />
+      <AppNavigator />
     </GMProvider>
   );
+}
+
+function AppNavigator() {
+  const { screen } = useContext(GMContext);
+  if (screen === 'connect') return <BleConnectionScreen />;
+  return <GMCountingScreen />;
 }
 
 // ─── Main Screen ─────────────────────────────────────────────────────────────
@@ -130,6 +155,7 @@ function GMCountingScreen() {
   const [hvStep, setHvStep] = useState(30); // HV jump: 30 V or 50 V
   const [refHv, setRefHv] = useState(0);
   const refHvRef = useRef(0);
+
 
   useEffect(() => {
     const iv = setInterval(() => {
@@ -195,10 +221,28 @@ function GMCountingScreen() {
   const [iterationRestartToken, setIterationRestartToken] = useState(0);
 
   const intervalRef = useRef(null);
-  const windowCountsRef = useRef(0);   // accumulator for current CPS/CPM window
-  const windowElapsedRef = useRef(0);  // seconds elapsed within current window
-  const displayedCountsRef = useRef(0); // mirror of displayedCounts — always live
-  const elapsedTimeRef = useRef(0);     // mirror of elapsedTime — always live
+  const windowCountsRef = useRef(0);
+  const windowElapsedRef = useRef(0);
+  const displayedCountsRef = useRef(0);
+  const elapsedTimeRef = useRef(0);
+  const bleIsConnectedRef = useRef(false); // mirror of ble.isConnected for interval
+
+  // ── BLE count injection — ALL refs declared above, safe to use here ──────────
+  const { countCallbackRef, ble } = useContext(GMContext);
+
+  // Keep bleIsConnectedRef in sync for the counting interval
+  useEffect(() => { bleIsConnectedRef.current = ble.isConnected; }, [ble.isConnected]);
+
+  useEffect(() => {
+    countCallbackRef.current = (count) => {
+      // Always push BLE values straight to the COUNT field.
+      // The counting interval gates start/stop; no extra guard needed here.
+      displayedCountsRef.current = count;
+      setDisplayedCounts(count);
+      setCounts(count);   // ← updates the COUNT : field on screen
+    };
+    return () => { countCallbackRef.current = null; };
+  }, []);
 
   // ── Database Initialization ───────────────────────────────────────────────
   useEffect(() => {
@@ -444,8 +488,12 @@ function GMCountingScreen() {
     if (!isRunning) return;
 
     intervalRef.current = setInterval(() => {
-      // Simulate one tick of GM tube counts
-      const tick = Math.floor(COUNT_RATE + (Math.random() - 0.5) * 40);
+      // When BLE detector is live, skip the simulated count increment —
+      // real values are pushed by the BLE queue via countCallbackRef.
+      // We still run the elapsed-time / auto-stop logic below.
+      const tick = bleIsConnectedRef.current
+        ? 0   // BLE mode: no simulated counts
+        : Math.floor(COUNT_RATE + (Math.random() - 0.5) * 40);
 
       if (acqMode === 'PRESET_TIME') {
         // ── Preset Time: accumulate counts, auto-stop (or repeat for iterations) ──
@@ -994,6 +1042,8 @@ function GMCountingScreen() {
           <Text style={styles.rearText}>STORE {storeDataMode}</Text>
           <Text style={styles.rearText}>MEM {String(memoryCount).padStart(4, '0')}</Text>
         </View>
+
+        {/* BLE panel removed — connection managed on the BLE boot screen */}
 
         {/* ─── Main display + HV slider in a row ─────────────────────────── */}
         <View style={styles.mainRow}>
