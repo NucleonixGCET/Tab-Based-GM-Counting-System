@@ -226,20 +226,23 @@ function GMCountingScreen() {
   const displayedCountsRef = useRef(0);
   const elapsedTimeRef = useRef(0);
   const bleIsConnectedRef = useRef(false); // mirror of ble.isConnected for interval
+  const isRunningRef = useRef(false);      // mirror of isRunning for BLE callback
 
   // ── BLE count injection — ALL refs declared above, safe to use here ──────────
   const { countCallbackRef, ble } = useContext(GMContext);
 
   // Keep bleIsConnectedRef in sync for the counting interval
   useEffect(() => { bleIsConnectedRef.current = ble.isConnected; }, [ble.isConnected]);
+  // Keep isRunningRef in sync — callback checks this to gate BLE count injection
+  useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
 
   useEffect(() => {
     countCallbackRef.current = (count) => {
-      // Always push BLE values straight to the COUNT field.
-      // The counting interval gates start/stop; no extra guard needed here.
+      // Only update the display while SRT is active (experiment in progress)
+      if (!isRunningRef.current) return;
       displayedCountsRef.current = count;
       setDisplayedCounts(count);
-      setCounts(count);   // ← updates the COUNT : field on screen
+      setCounts(count);   // ← updates the COUNT field on screen
     };
     return () => { countCallbackRef.current = null; };
   }, []);
@@ -537,36 +540,50 @@ function GMCountingScreen() {
         });
 
       } else if (acqMode === 'CPS') {
-        // ── CPS: show count for every individual second, reset each second ─
-        windowCountsRef.current += tick;
-        const cpsValue = windowCountsRef.current;
-        displayedCountsRef.current = cpsValue;
-        setDisplayedCounts(cpsValue);   // update display every second
-        
-        // Push the active CPS into the history array for RECALL
-        iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpsValue, refHv: refHvRef.current });
-        
-        windowCountsRef.current = 0;    // reset for next second
-        elapsedTimeRef.current += 1;
-        setElapsedTime((t) => t + 1);
+        // ── CPS mode ─────────────────────────────────────────────────────────
+        if (bleIsConnectedRef.current) {
+          // BLE drives the display — interval only manages elapsed time & history
+          const cpsValue = displayedCountsRef.current;
+          iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpsValue, refHv: refHvRef.current });
+          elapsedTimeRef.current += 1;
+          setElapsedTime((t) => t + 1);
+        } else {
+          // Simulated mode: accumulate tick, snapshot, reset window each second
+          windowCountsRef.current += tick;
+          const cpsValue = windowCountsRef.current;
+          displayedCountsRef.current = cpsValue;
+          setDisplayedCounts(cpsValue);
+          iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpsValue, refHv: refHvRef.current });
+          windowCountsRef.current = 0;
+          elapsedTimeRef.current += 1;
+          setElapsedTime((t) => t + 1);
+        }
 
       } else if (acqMode === 'CPM') {
-        // ── CPM: accumulate for 60 s, snapshot, reset, repeat ─────────────
-        windowCountsRef.current += tick;
-        windowElapsedRef.current += 1;
+        // ── CPM mode ─────────────────────────────────────────────────────────
         elapsedTimeRef.current += 1;
         setElapsedTime((t) => t + 1);
 
-        if (windowElapsedRef.current >= 60) {
-          const cpmValue = windowCountsRef.current;
-          displayedCountsRef.current = cpmValue;
-          setDisplayedCounts(cpmValue); // snapshot completed minute
-          
-          // Push active CPM into the history array
-          iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpmValue, refHv: refHvRef.current });
-          
-          windowCountsRef.current = 0;               // reset
-          windowElapsedRef.current = 0;
+        if (bleIsConnectedRef.current) {
+          // BLE drives the display — only snapshot to history every 60 s
+          windowElapsedRef.current += 1;
+          if (windowElapsedRef.current >= 60) {
+            const cpmValue = displayedCountsRef.current;
+            iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpmValue, refHv: refHvRef.current });
+            windowElapsedRef.current = 0;
+          }
+        } else {
+          // Simulated mode: accumulate tick, snapshot at 60 s boundary
+          windowCountsRef.current += tick;
+          windowElapsedRef.current += 1;
+          if (windowElapsedRef.current >= 60) {
+            const cpmValue = windowCountsRef.current;
+            displayedCountsRef.current = cpmValue;
+            setDisplayedCounts(cpmValue);
+            iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpmValue, refHv: refHvRef.current });
+            windowCountsRef.current = 0;
+            windowElapsedRef.current = 0;
+          }
         }
       }
     }, 1000);

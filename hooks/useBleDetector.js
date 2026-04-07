@@ -163,6 +163,7 @@ export function useBleDetector({ onCountReceived } = {}) {
   // per second so the display ticks naturally like a live counter.
   const countQueueRef  = useRef([]);       // FIFO of parsed integers
   const queueTimerRef  = useRef(null);     // setTimeout handle for drainer
+  const retryCountRef  = useRef(0);        // stale-connection auto-retry counter
 
   // ── BLE Manager lifecycle ──────────────────────────────────────
   useEffect(() => {
@@ -240,21 +241,70 @@ export function useBleDetector({ onCountReceived } = {}) {
       return;
     }
 
+    // ── Log every service + characteristic so we can see the real UUIDs ──
+    let notifySvcUUID = null;
+    let notifyCharUUID = null;
+    try {
+      const services = await device.services();
+      for (const svc of services) {
+        console.log('[BLE] Service:', svc.uuid);
+        const chars = await svc.characteristics();
+        for (const ch of chars) {
+          console.log(
+            `[BLE]   Char: ${ch.uuid}` +
+            ` | notify=${ch.isNotifiable}` +
+            ` | indicate=${ch.isIndicatable}` +
+            ` | read=${ch.isReadable}` +
+            ` | write=${ch.isWritableWithResponse}`
+          );
+          // Prefer a characteristic that is notifiable but NOT writable —
+          // that's the TX channel (data FROM device). Skip RX (write+notify).
+          const isPureNotify = (ch.isNotifiable || ch.isIndicatable) && !ch.isWritableWithResponse;
+          if (!notifyCharUUID && isPureNotify) {
+            notifySvcUUID  = svc.uuid;
+            notifyCharUUID = ch.uuid;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[BLE] Could not enumerate services:', e.message);
+    }
+
+    // Fall back to hardcoded Nordic UART UUIDs if auto-detect missed
+    const svcUUID  = notifySvcUUID  ?? UART_SERVICE_UUID;
+    const charUUID = notifyCharUUID ?? UART_RX_CHAR_UUID;
+    console.log(`[BLE] Monitoring  svc=${svcUUID}  char=${charUUID}`);
+
+    const connectedAt = Date.now();
     dispatch({ type: 'MONITORING' });
     isConnectingRef.current = false;
 
     device.onDisconnected((error, dev) => {
-      console.log('[BLE] Disconnected:', dev?.id, error?.message);
+      const aliveMs = Date.now() - connectedAt;
+      console.log('[BLE] Disconnected:', dev?.id, `| alive ${aliveMs}ms`, error?.message ?? '');
       _stopMonitor();
       dispatch({ type: 'DISCONNECTED' });
+
+      if (aliveMs < 2000 && retryCountRef.current < 3) {
+        retryCountRef.current += 1;
+        console.log(`[BLE] Stale connection — auto-retry #${retryCountRef.current} in 1.5 s …`);
+        setTimeout(async () => {
+          if (!isScanningRef.current && !isConnectingRef.current) {
+            dispatch({ type: 'STATUS', payload: BLE_STATUS.CONNECTING });
+            await _connectToDevice(dev);
+          }
+        }, 1500);
+      } else {
+        retryCountRef.current = 0;
+      }
     });
 
     monitorSubRef.current = device.monitorCharacteristicForService(
-      UART_SERVICE_UUID,
-      UART_RX_CHAR_UUID,
+      svcUUID,
+      charUUID,
       (error, characteristic) => {
         if (error) {
-          if (error.errorCode !== 205) {
+          if (error.errorCode !== 205 && error.errorCode !== 2) {
             console.error('[BLE] Monitor error:', error.message, '| code:', error.errorCode);
             dispatch({ type: 'ERROR', payload: `Monitor error (code ${error.errorCode ?? '?'})` });
           }
@@ -264,7 +314,7 @@ export function useBleDetector({ onCountReceived } = {}) {
         const counts = parseCountValues(raw);
         if (counts.length > 0) {
           console.log('[BLE] Queuing counts:', counts);
-          _enqueueCounts(counts);   // drains 1 per second to the display
+          _enqueueCounts(counts);
         } else {
           console.warn('[BLE] No counts parsed from frame:', JSON.stringify(raw));
         }
@@ -278,12 +328,25 @@ export function useBleDetector({ onCountReceived } = {}) {
 
     _stopScan();
     dispatch({ type: 'STATUS', payload: BLE_STATUS.CONNECTING });
-    console.log('[BLE] Connecting to', device.name ?? device.id);
+    console.log('[BLE] Connecting to', device.name ?? device.localName ?? device.id);
+
+    // Cancel any stale native connection for this device ID before
+    // trying to connect — prevents immediate disconnect on hot-reload.
+    try {
+      await managerRef.current.cancelDeviceConnection(device.id);
+      console.log('[BLE] Cleared stale connection for', device.id);
+    } catch (_) {
+      // No existing connection — that's fine, continue.
+    }
 
     try {
       const connected = await device.connect({ timeout: 10_000, autoConnect: false });
-      dispatch({ type: 'CONNECTED', payload: connected });
       console.log('[BLE] Connected:', connected.id);
+      dispatch({ type: 'CONNECTED', payload: connected });
+
+      // Give the device 400 ms to stabilize before GATT operations.
+      await new Promise(resolve => setTimeout(resolve, 400));
+
       await _startMonitor(connected);
     } catch (e) {
       console.error('[BLE] Connection failed:', e.message, '| code:', e.errorCode);
