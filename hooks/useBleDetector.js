@@ -418,10 +418,10 @@ export function useBleDetector({ onCountReceived } = {}) {
           payload: { id: device.id, name, rssi: device.rssi ?? 0 },
         });
 
-        // Auto-connect if name matches keyword
+        // Auto-connect disabled: device is added to picker list for manual connection.
+        // User must tap the device row (or press CONNECT) in BleConnectionScreen.
         if (name.toLowerCase().includes(AUTO_CONNECT_KEYWORD.toLowerCase())) {
-          console.log('[BLE] Auto-connecting to matched device:', name);
-          await _connectToDevice(device);
+          console.log('[BLE] Detector found (awaiting manual connect):', name);
         }
       }
     );

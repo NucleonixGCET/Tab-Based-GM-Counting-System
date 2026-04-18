@@ -87,4 +87,4 @@ The application expects a detector running firmware compatible with the **Nordic
 Internal Project for Nucleonix GCET. All rights reserved.
 
 ---
-*Built with ❤️ for precision radiation measurement.*
+*Built with ❤️ for precision radiation measurement.*r

@@ -1,11 +1,12 @@
 /**
  * GM Counting System — App.js
- * Implements GM counting screen programming workflow
+ * Visual design matches the NUCLEONIX GC-602A physical instrument.
  *
  * ACQ Modes  : PRESET_TIME (default) | CPS | CPM
  * PROG Cycle : OFF → ACQ_SELECT → TIME_ADJUST → READINGS_ADJUST
- *            → LABEL_ASSIGN → ITERATION_ADJUST → SAVE_CONFIRM → OFF
- * HV Control : Draggable helipot slider (right = increase)
+ *            → [ITERATION_ADJUST → DHV_ADJUST for PRESET_TIME only]
+ *            → SAVE_CONFIRM → DATA_STORE → DATA_OUTPUT → DATA_RECALL → DATA_ERASE → OFF
+ * HV Control : Arrow buttons at bottom of main panel (30 V or 50 V steps)
  * Global HV  : React Context (GMContext)
  */
 
@@ -19,32 +20,27 @@ import React, {
 import {
   View,
   Text,
-  TextInput,
   TouchableOpacity,
   StyleSheet,
   Alert,
   Platform,
   StatusBar,
   SafeAreaView,
-  Image,
   ScrollView,
 } from 'react-native';
 import * as SQLite from 'expo-sqlite';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { useBleDetector } from './hooks/useBleDetector';
-import BleConnectionScreen from './screens/BleConnectionScreen';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-const DATABASE_NAME = 'NP.db';
-const HV_MIN = 0;
-const HV_MAX = 1200;
-const DEFAULT_HV = 400;
-const DEFAULT_PR_TIME = 10;   // seconds
-const COUNT_RATE = 127;  // simulated counts / second
+const DATABASE_NAME    = 'NP.db';
+const HV_MIN           = 0;
+const HV_MAX           = 1500;
+const DEFAULT_HV       = 400;
+const DEFAULT_PR_TIME  = 10;
+const COUNT_RATE       = 127;
 
-
-/** Display labels for each mode */
 const ACQ_LABELS = {
   PRESET_TIME: 'PRESET TIME',
   CPS: 'CPS',
@@ -53,76 +49,62 @@ const ACQ_LABELS = {
 
 const ACQ_MODE_ORDER = ['PRESET_TIME', 'CPS', 'CPM'];
 
-/** PROG sub-mode cycle states */
-const PROG_OFF = 'OFF';
-const PROG_ACQ_SELECT = 'ACQ_SELECT';      // ① ▲/▼ cycle ACQ mode
-const PROG_TIME_ADJUST = 'TIME_ADJUST';     // ② ▲ increment digit · ▼ move cursor left
-const PROG_READINGS_ADJUST = 'READINGS_ADJUST'; // ③ ▲ increment digit · ▼ move cursor left
-const PROG_LABEL_ASSIGN = 'LABEL_ASSIGN';    // ④ ▲/▼ cycle label: SP → ST → BG
-const PROG_ITERATION_ADJUST = 'ITERATION_ADJUST'; // ⑤ ▲/▼ set iteration count (1–9)
-const PROG_DHV_ADJUST = 'DHV_ADJUST';       // ⑥ ▲/▼ set delta HV
-const PROG_SAVE_CONFIRM = 'SAVE_CONFIRM';      // ⑦ press ▲/▼ to save · PROG to discard
-const PROG_SHOW_OK = 'SHOW_OK';           // transient 1-second OK flash
+const PROG_OFF              = 'OFF';
+const PROG_ACQ_SELECT       = 'ACQ_SELECT';
+const PROG_TIME_ADJUST      = 'TIME_ADJUST';
+const PROG_READINGS_ADJUST  = 'READINGS_ADJUST';
+const PROG_ITERATION_ADJUST = 'ITERATION_ADJUST';
+const PROG_DHV_ADJUST       = 'DHV_ADJUST';
+const PROG_SAVE_CONFIRM     = 'SAVE_CONFIRM';
+const PROG_SHOW_OK          = 'SHOW_OK';
 
-const BOOT_GEIGER = 'BOOT_GEIGER';
+const PROG_DATA_STORE  = 'DATA_STORE';
+const PROG_DATA_OUTPUT = 'DATA_OUTPUT';
+const PROG_DATA_RECALL = 'DATA_RECALL';
+const PROG_DATA_ERASE  = 'DATA_ERASE';
+const PROG_SET_HV      = 'SET_HV';        // set base HV before saving
+
+const PROG_DATA_SUBS = [PROG_DATA_STORE, PROG_DATA_OUTPUT, PROG_DATA_RECALL, PROG_DATA_ERASE];
+
+const BOOT_GEIGER    = 'BOOT_GEIGER';
 const BOOT_NUCLEONIX = 'BOOT_NUCLEONIX';
-const BOOT_READY = 'BOOT_READY';
+const BOOT_READY     = 'BOOT_READY';
 
-const DATA_OFF = 'DATA_OFF';
-const DATA_STORE_MODE = 'DATA_STORE_MODE';
-const DATA_OUTPUT_ROUTE = 'DATA_OUTPUT_ROUTE';
-const DATA_RECALL = 'DATA_RECALL';
-const DATA_ERASE_CONFIRM = 'DATA_ERASE_CONFIRM';
-const DATA_MESSAGE = 'DATA_MESSAGE';
-
-const STORE_MODE_AUTO = 'AUTO';
-const STORE_MODE_MANUAL = 'MANUAL';
-const OUTPUT_ROUTE_USB = 'USB_PC';
+const STORE_MODE_AUTO    = 'AUTO';
+const STORE_MODE_MANUAL  = 'MANUAL';
+const OUTPUT_ROUTE_USB     = 'USB_PC';
 const OUTPUT_ROUTE_PRINTER = 'PRINTER_D25';
-const OUTPUT_ROUTE_LABELS = {
-  [OUTPUT_ROUTE_USB]: 'USB SERIAL -> PC',
-  [OUTPUT_ROUTE_PRINTER]: '25-PIN D -> PRINTER',
+const OUTPUT_ROUTE_LABELS  = {
+  [OUTPUT_ROUTE_USB]:     'USB SERIAL → PC',
+  [OUTPUT_ROUTE_PRINTER]: '25-PIN D → PRINTER',
 };
 
-/** Dashboard parameter field states (replacement for 6-stage PROG cycle) */
-const PARAM_FIELD_TIMER = 'TIMER';
-const PARAM_FIELD_READINGS = 'READINGS';
-const PARAM_FIELD_LABEL = 'LABEL';
+const PARAM_FIELD_TIMER      = 'TIMER';
+const PARAM_FIELD_READINGS   = 'READINGS';
 const PARAM_FIELD_ITERATIONS = 'ITERATIONS';
-const PARAM_FIELD_DHV = 'DHV';
+const PARAM_FIELD_DHV        = 'DHV';
 
-const PARAM_FIELD_ORDER = [PARAM_FIELD_TIMER, PARAM_FIELD_READINGS, PARAM_FIELD_LABEL, PARAM_FIELD_ITERATIONS, PARAM_FIELD_DHV];
-
-/** Label options */
-const LABEL_OPTIONS = ['SP', 'ST', 'BG'];
-const LABEL_NAMES = { SP: 'Sample', ST: 'Standard', BG: 'Background' };
-
-/** Convert a 1–9999 number into [thousands, hundreds, tens, units] digit array */
 const numToDigits = (n) => {
   const s = String(Math.max(0, Math.min(9999, n))).padStart(4, '0');
   return s.split('').map(Number);
 };
-/** Convert a digit array back to a number (min 1) */
 const digitsToNum = (d) => Math.max(1, d[0] * 1000 + d[1] * 100 + d[2] * 10 + d[3]);
 
 // ─── Global GM Context ───────────────────────────────────────────────────────
 export const GMContext = createContext(null);
 
 function GMProvider({ children }) {
-  const [hv, setHv] = useState(DEFAULT_HV);
-  const [screen, setScreen] = useState('connect'); // 'connect' | 'main'
+  const [hv, setHv]       = useState(DEFAULT_HV);
+  const [screen, setScreen] = useState('connect');
 
-  // Callback ref: GMCountingScreen registers here to receive live BLE counts
   const countCallbackRef = useRef(null);
 
-  // Single BLE manager lives here — survives screen transitions
   const ble = useBleDetector({
     onCountReceived: (count) => {
       countCallbackRef.current?.(count);
     },
   });
 
-  // Auto-navigate to main when detector connects
   useEffect(() => {
     if (ble.isConnected) setScreen('main');
   }, [ble.isConnected]);
@@ -134,120 +116,99 @@ function GMProvider({ children }) {
   );
 }
 
-// ─── Root Export ─────────────────────────────────────────────────────────────
 export default function App() {
   return (
     <GMProvider>
-      <AppNavigator />
+      <GMCountingScreen />
     </GMProvider>
   );
-}
-
-function AppNavigator() {
-  const { screen } = useContext(GMContext);
-  if (screen === 'connect') return <BleConnectionScreen />;
-  return <GMCountingScreen />;
 }
 
 // ─── Main Screen ─────────────────────────────────────────────────────────────
 function GMCountingScreen() {
   const { hv, setHv } = useContext(GMContext);
-  const [hvStep, setHvStep] = useState(30); // HV jump: 30 V or 50 V
-  const [refHv, setRefHv] = useState(0);
+  const [hvStep, setHvStep] = useState(30);
   const refHvRef = useRef(0);
-
 
   useEffect(() => {
     const iv = setInterval(() => {
-      // Simulate live hardware analogue voltage returns
-      const activeHv = Math.max(0, hv + Math.floor((Math.random() - 0.5) * 6));
-      setRefHv(activeHv);
-      refHvRef.current = activeHv;
+      refHvRef.current = Math.max(0, hv + Math.floor((Math.random() - 0.5) * 6));
     }, 1000);
     return () => clearInterval(iv);
   }, [hv]);
 
-  const [bootStage, setBootStage] = useState(BOOT_GEIGER);
-  const [dataMode, setDataMode] = useState(DATA_OFF);
-  const [storeDataMode, setStoreDataMode] = useState(STORE_MODE_AUTO);
-  const [outputRoute, setOutputRoute] = useState(OUTPUT_ROUTE_USB);
-  const [storedReadings, setStoredReadings] = useState([]);
-  const [recallIndex, setRecallIndex] = useState(-1);
+  const [bootStage, setBootStage]             = useState(BOOT_GEIGER);
+  const [storeDataMode, setStoreDataMode]     = useState(STORE_MODE_AUTO);
+  const [outputRoute, setOutputRoute]         = useState(OUTPUT_ROUTE_USB);
+  const [storedReadings, setStoredReadings]   = useState([]);
+  const [recallIndex, setRecallIndex]         = useState(-1);
   const [pendingMeasurement, setPendingMeasurement] = useState(null);
-  const [dataMessage, setDataMessage] = useState('');
-  const nextSerialNoRef = useRef(1);
-  const dbRef = useRef(null);
-  const dataModeTimeoutRef = useRef(null);
+  const [flashMessage, setFlashMessage]       = useState('');
+  const [isBleMenuOpen, setIsBleMenuOpen]     = useState(false);
+
+
+  const nextSerialNoRef    = useRef(1);
+  const dbRef              = useRef(null);
+  const flashTimeoutRef    = useRef(null);
   const rearPanelConfigRef = useRef({
-    detectorInput: 'MHV SOCKET',
-    powerInput: '+12V ADAPTOR',
-    printerPort: '25-PIN D CONNECTOR',
-    powerConnected: true,
+    detectorInput:     'MHV SOCKET',
+    powerInput:        '+12V ADAPTOR',
+    printerPort:       '25-PIN D CONNECTOR',
+    powerConnected:    true,
     detectorConnected: true,
   });
 
-  // Acquisition
-  const [acqMode, setAcqMode] = useState('PRESET_TIME');
+  const [acqMode, setAcqMode]           = useState('PRESET_TIME');
   const [draftAcqMode, setDraftAcqMode] = useState('PRESET_TIME');
-  const [progSub, setProgSub] = useState(PROG_OFF);   // PROG cycle state
-
-  // Preset-time digit editing (used during PROG_TIME_ADJUST)
-  const [cursorPos, setCursorPos] = useState(0);           // 0=thousands … 3=units
-  const [draftDigits, setDraftDigits] = useState([0, 0, 1, 0]);
+  const [progSub, setProgSub]           = useState(PROG_OFF);
+  const [cursorPos, setCursorPos]       = useState(0);
+  const [draftDigits, setDraftDigits]   = useState([0, 0, 1, 0]);
   const okTimeoutRef = useRef(null);
 
-  // Label assignment (used during PROG_LABEL_ASSIGN)
-  const [label, setLabel] = useState('SP');
-  const [draftLabel, setDraftLabel] = useState('SP');
-
-  // Iteration & dHV (used during PROG cycles)
   const DEFAULT_ITERATIONS = 1;
-  const [iterations, setIterations] = useState(DEFAULT_ITERATIONS);      // committed
-  const [draftIterations, setDraftIterations] = useState(DEFAULT_ITERATIONS); // staging
-  const [dHv, setDHv] = useState(0);              // committed delta HV
-  const [draftDHv, setDraftDHv] = useState(0);    // staging delta HV
-  const [activeParamField, setActiveParamField] = useState(PARAM_FIELD_TIMER);  // NEW: tracks which parameter is shown
-  // Runtime iteration tracking
-  const [currentIteration, setCurrentIteration] = useState(0);           // which cycle we're on
-  const iterationResultsRef = useRef([]);                                  // accumulated counts
-  const programSessionRef = useRef(null);
+  const [iterations, setIterations]           = useState(DEFAULT_ITERATIONS);
+  const [draftIterations, setDraftIterations] = useState(DEFAULT_ITERATIONS);
+  const [dHv, setDHv]         = useState(0);
+  const [draftDHv, setDraftDHv] = useState(0);
+  const [activeParamField, setActiveParamField] = useState(PARAM_FIELD_TIMER);
 
-  // Counting state
-  const [counts, setCounts] = useState(0);
-  const [displayedCounts, setDisplayedCounts] = useState(0); // last completed window
-  const [presetTime, setPresetTime] = useState(DEFAULT_PR_TIME);
-  const [isRunning, setIsRunning] = useState(false);
-  const [elapsedTime, setElapsedTime] = useState(0);
+  const [currentIteration, setCurrentIteration] = useState(0);
+  const iterationResultsRef = useRef([]);
+  const programSessionRef   = useRef(null);
+
+  const [counts, setCounts]                   = useState(0);
+  const [displayedCounts, setDisplayedCounts] = useState(0);
+  const [presetTime, setPresetTime]           = useState(DEFAULT_PR_TIME);
+  const [isRunning, setIsRunning]             = useState(false);
+  const [elapsedTime, setElapsedTime]         = useState(0);
   const [iterationRestartToken, setIterationRestartToken] = useState(0);
+  const [blinkOn, setBlinkOn]                 = useState(true);  // blinking 'A' during counting
+  const blinkTimerRef = useRef(null);
 
-  const intervalRef = useRef(null);
-  const windowCountsRef = useRef(0);
-  const windowElapsedRef = useRef(0);
+  const intervalRef        = useRef(null);
+  const windowCountsRef    = useRef(0);
+  const windowElapsedRef   = useRef(0);
   const displayedCountsRef = useRef(0);
-  const elapsedTimeRef = useRef(0);
-  const bleIsConnectedRef = useRef(false); // mirror of ble.isConnected for interval
-  const isRunningRef = useRef(false);      // mirror of isRunning for BLE callback
+  const elapsedTimeRef     = useRef(0);
+  const bleIsConnectedRef  = useRef(false);
+  const isRunningRef       = useRef(false);
 
-  // ── BLE count injection — ALL refs declared above, safe to use here ──────────
   const { countCallbackRef, ble } = useContext(GMContext);
 
-  // Keep bleIsConnectedRef in sync for the counting interval
   useEffect(() => { bleIsConnectedRef.current = ble.isConnected; }, [ble.isConnected]);
-  // Keep isRunningRef in sync — callback checks this to gate BLE count injection
   useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
 
   useEffect(() => {
     countCallbackRef.current = (count) => {
-      // Only update the display while SRT is active (experiment in progress)
       if (!isRunningRef.current) return;
       displayedCountsRef.current = count;
       setDisplayedCounts(count);
-      setCounts(count);   // ← updates the COUNT field on screen
+      setCounts(count);
     };
     return () => { countCallbackRef.current = null; };
   }, []);
 
-  // ── Database Initialization ───────────────────────────────────────────────
+  // ── Database ─────────────────────────────────────────────────────────────
   useEffect(() => {
     try {
       const db = SQLite.openDatabaseSync(DATABASE_NAME);
@@ -255,28 +216,14 @@ function GMCountingScreen() {
       db.execSync(`
         CREATE TABLE IF NOT EXISTS measurements (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
-          serialNo INTEGER,
-          value INTEGER,
-          acqMode TEXT,
-          presetTime INTEGER,
-          numberOfReadings INTEGER,
-          label TEXT,
-          iterations INTEGER,
-          dHv INTEGER,
-          iterationResults TEXT,
-          hv INTEGER,
-          storeDataMode TEXT,
-          outputRoute TEXT,
-          detectorInput TEXT,
-          powerInput TEXT,
+          serialNo INTEGER, value INTEGER, acqMode TEXT, presetTime INTEGER,
+          numberOfReadings INTEGER, label TEXT, iterations INTEGER, dHv INTEGER,
+          iterationResults TEXT, hv INTEGER, storeDataMode TEXT, outputRoute TEXT,
+          detectorInput TEXT, powerInput TEXT,
           timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         );
       `);
-
-      // Schema migrations — add any column that may be missing from older on-device tables.
-      // SQLite has no "ADD COLUMN IF NOT EXISTS", so each ALTER TABLE is wrapped in its own
-      // try/catch; the error thrown when a column already exists is silently ignored.
-      const migrateColumns = [
+      const cols = [
         'ALTER TABLE measurements ADD COLUMN serialNo INTEGER;',
         'ALTER TABLE measurements ADD COLUMN iterationResults TEXT;',
         'ALTER TABLE measurements ADD COLUMN hv INTEGER;',
@@ -285,252 +232,171 @@ function GMCountingScreen() {
         'ALTER TABLE measurements ADD COLUMN detectorInput TEXT;',
         'ALTER TABLE measurements ADD COLUMN powerInput TEXT;',
       ];
-      for (const sql of migrateColumns) {
-        try { db.execSync(sql); } catch (_) { /* column already exists */ }
-      }
+      for (const sql of cols) { try { db.execSync(sql); } catch (_) {} }
 
       const rows = db.getAllSync('SELECT * FROM measurements ORDER BY serialNo ASC');
       if (rows && rows.length > 0) {
-        const parsedRows = rows.map((r) => ({
+        const parsed = rows.map((r) => ({
           ...r,
           iterationResults: r.iterationResults ? JSON.parse(r.iterationResults) : [],
         }));
-        setStoredReadings(parsedRows);
-        const maxSerial = parsedRows[parsedRows.length - 1].serialNo;
-        nextSerialNoRef.current = maxSerial + 1;
-        setRecallIndex(parsedRows.length - 1);
+        setStoredReadings(parsed);
+        nextSerialNoRef.current = parsed[parsed.length - 1].serialNo + 1;
+        setRecallIndex(parsed.length - 1);
       }
     } catch (err) {
-      console.error('Failed to initialize local GM Database:', err);
+      console.error('DB init error:', err);
     }
   }, []);
 
   useEffect(() => {
-    const geigerTimer = setTimeout(() => setBootStage(BOOT_NUCLEONIX), 3000);
-    const readyTimer = setTimeout(() => setBootStage(BOOT_READY), 6000);
-
-    return () => {
-      clearTimeout(geigerTimer);
-      clearTimeout(readyTimer);
-    };
+    const g = setTimeout(() => setBootStage(BOOT_NUCLEONIX), 3000);
+    const r = setTimeout(() => setBootStage(BOOT_READY), 6000);
+    return () => { clearTimeout(g); clearTimeout(r); };
   }, []);
 
   useEffect(() => {
     return () => {
-      if (okTimeoutRef.current) {
-        clearTimeout(okTimeoutRef.current);
-      }
-      if (dataModeTimeoutRef.current) {
-        clearTimeout(dataModeTimeoutRef.current);
-      }
+      if (okTimeoutRef.current)    clearTimeout(okTimeoutRef.current);
+      if (flashTimeoutRef.current) clearTimeout(flashTimeoutRef.current);
+      if (blinkTimerRef.current)   clearInterval(blinkTimerRef.current);
     };
   }, []);
 
-  const beginProgrammingSession = () => {
-    const snapshot = {
-      acqMode,
-      presetTime,
-      label,
-      iterations,
-      dHv,
-    };
+  // Blink the 'A' indicator every 500 ms while counting
+  useEffect(() => {
+    if (isRunning) {
+      blinkTimerRef.current = setInterval(() => setBlinkOn((v) => !v), 500);
+    } else {
+      if (blinkTimerRef.current) clearInterval(blinkTimerRef.current);
+      setBlinkOn(true);
+    }
+    return () => { if (blinkTimerRef.current) clearInterval(blinkTimerRef.current); };
+  }, [isRunning]);
 
-    programSessionRef.current = snapshot;
-    setDraftAcqMode(snapshot.acqMode);
-    setDraftDigits(numToDigits(snapshot.presetTime));
+  // ── Programming Session ──────────────────────────────────────────────────
+  const beginProgrammingSession = () => {
+    const snap = { acqMode, presetTime, iterations, dHv };
+    programSessionRef.current = snap;
+    setDraftAcqMode(snap.acqMode);
+    setDraftDigits(numToDigits(snap.presetTime));
     setCursorPos(0);
-    setDraftLabel(snapshot.label);
-    setDraftIterations(snapshot.iterations);
-    setDraftDHv(snapshot.dHv);
+    setDraftIterations(snap.iterations);
+    setDraftDHv(snap.dHv);
   };
 
   const discardProgrammingSession = () => {
-    const snapshot = programSessionRef.current;
-
-    if (snapshot) {
-      setDraftAcqMode(snapshot.acqMode);
-      setDraftDigits(numToDigits(snapshot.presetTime));
-      setDraftLabel(snapshot.label);
-      setDraftIterations(snapshot.iterations);
-      setDraftDHv(snapshot.dHv);
+    const snap = programSessionRef.current;
+    if (snap) {
+      setDraftAcqMode(snap.acqMode);
+      setDraftDigits(numToDigits(snap.presetTime));
+      setDraftIterations(snap.iterations);
+      setDraftDHv(snap.dHv);
     }
-
     setCursorPos(0);
-    setActiveParamField(PARAM_FIELD_TIMER);  // Reset to default parameter
+    setActiveParamField(PARAM_FIELD_TIMER);
     programSessionRef.current = null;
-    setProgSub(PROG_OFF);
+    setProgSub(PROG_OFF);   // SAVE is now last; discard just exits
   };
 
   const commitProgrammingSession = () => {
-    const nextPresetTime = digitsToNum(draftDigits);
-
     setAcqMode(draftAcqMode);
-    setPresetTime(nextPresetTime);
-    setLabel(draftLabel);
+    setPresetTime(digitsToNum(draftDigits));
     setIterations(draftIterations);
     setDHv(draftDHv);
-    setActiveParamField(PARAM_FIELD_TIMER);  // Reset to default parameter
+    setActiveParamField(PARAM_FIELD_TIMER);
     programSessionRef.current = null;
-
-    if (okTimeoutRef.current) {
-      clearTimeout(okTimeoutRef.current);
-    }
-
+    if (okTimeoutRef.current) clearTimeout(okTimeoutRef.current);
     setProgSub(PROG_SHOW_OK);
     okTimeoutRef.current = setTimeout(() => {
-      setProgSub(PROG_OFF);
+      setProgSub(PROG_OFF);   // SAVE is last; after OK just exit
       okTimeoutRef.current = null;
     }, 1000);
   };
 
-  const showDataMessage = (message, duration = 1000) => {
-    if (dataModeTimeoutRef.current) {
-      clearTimeout(dataModeTimeoutRef.current);
-    }
-
-    setDataMessage(message);
-    setDataMode(DATA_MESSAGE);
-    dataModeTimeoutRef.current = setTimeout(() => {
-      setDataMode(DATA_OFF);
-      setDataMessage('');
-      dataModeTimeoutRef.current = null;
+  // ── Flash Message ────────────────────────────────────────────────────────
+  const showFlashMessage = (msg, duration = 1500) => {
+    if (flashTimeoutRef.current) clearTimeout(flashTimeoutRef.current);
+    setFlashMessage(msg);
+    flashTimeoutRef.current = setTimeout(() => {
+      setFlashMessage('');
+      flashTimeoutRef.current = null;
     }, duration);
   };
 
+  // ── Data Storage ─────────────────────────────────────────────────────────
   const appendStoredMeasurement = (measurement) => {
-    const entry = {
-      ...measurement,
-      serialNo: nextSerialNoRef.current,
-    };
-
+    const entry = { ...measurement, serialNo: nextSerialNoRef.current };
     try {
       const db = dbRef.current;
-      if (!db) throw new Error('Database not initialized');
-      db.runSync(`
-        INSERT INTO measurements (
-          serialNo, value, acqMode, presetTime, numberOfReadings,
-          label, iterations, dHv, iterationResults, hv,
-          storeDataMode, outputRoute, detectorInput, powerInput
-        ) VALUES (
-          ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?,
-          ?, ?, ?, ?
-        )`,
-        [
-          entry.serialNo, entry.value, entry.acqMode, entry.presetTime, entry.numberOfReadings,
-          entry.label, entry.iterations, entry.dHv, JSON.stringify(entry.iterationResults || []), entry.hv,
-          entry.storeDataMode, entry.outputRoute, entry.detectorInput, entry.powerInput
-        ]
-      );
-    } catch (err) {
-      console.error('Failed to store reading into Database:', err);
-    }
-
+      if (!db) throw new Error('DB not ready');
+      db.runSync(`INSERT INTO measurements (
+        serialNo, value, acqMode, presetTime, numberOfReadings,
+        label, iterations, dHv, iterationResults, hv,
+        storeDataMode, outputRoute, detectorInput, powerInput
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [
+        entry.serialNo, entry.value, entry.acqMode, entry.presetTime, entry.numberOfReadings,
+        'SP', entry.iterations, entry.dHv, JSON.stringify(entry.iterationResults || []), entry.hv,
+        entry.storeDataMode, entry.outputRoute, entry.detectorInput, entry.powerInput,
+      ]);
+    } catch (err) { console.error('Store error:', err); }
     nextSerialNoRef.current += 1;
     setStoredReadings((prev) => [...prev, entry]);
     setRecallIndex(storedReadings.length);
-
     return entry;
   };
 
   const queueMeasurement = (value) => {
-    const measurement = {
-      value,
-      acqMode,
+    const m = {
+      value, acqMode,
       presetTime: (acqMode === 'CPS' || acqMode === 'CPM') ? elapsedTimeRef.current : presetTime,
       numberOfReadings: storedReadings.length,
-      label,
-      iterations,
-      dHv,
+      iterations, dHv,
       iterationResults: [...iterationResultsRef.current],
-      hv,
-      storeDataMode,
-      outputRoute,
+      hv, storeDataMode, outputRoute,
       detectorInput: rearPanelConfigRef.current.detectorInput,
-      powerInput: rearPanelConfigRef.current.powerInput,
+      powerInput:    rearPanelConfigRef.current.powerInput,
     };
-
     if (storeDataMode === STORE_MODE_AUTO) {
-      appendStoredMeasurement(measurement);
+      appendStoredMeasurement(m);
       setPendingMeasurement(null);
-      return;
-    }
-
-    setPendingMeasurement(measurement);
-  };
-
-  const cycleDataMode = () => {
-    if (dataMode === DATA_OFF) {
-      setDataMode(DATA_STORE_MODE);
-      return;
-    }
-
-    if (dataMode === DATA_STORE_MODE) {
-      setDataMode(DATA_OUTPUT_ROUTE);
-      return;
-    }
-
-    if (dataMode === DATA_OUTPUT_ROUTE) {
-      setRecallIndex(storedReadings.length > 0 ? storedReadings.length - 1 : -1);
-      setDataMode(DATA_RECALL);
-      return;
-    }
-
-    if (dataMode === DATA_RECALL) {
-      setDataMode(DATA_ERASE_CONFIRM);
-      return;
-    }
-
-    if (dataMode === DATA_ERASE_CONFIRM) {
-      setDataMode(DATA_OFF);
+    } else {
+      setPendingMeasurement(m);
     }
   };
 
-  // ── Counting loop ─────────────────────────────────────────────────────────
+  // ── Counting loop ────────────────────────────────────────────────────────
   useEffect(() => {
     if (!isRunning) return;
-
     intervalRef.current = setInterval(() => {
-      // When BLE detector is live, skip the simulated count increment —
-      // real values are pushed by the BLE queue via countCallbackRef.
-      // We still run the elapsed-time / auto-stop logic below.
-      const tick = bleIsConnectedRef.current
-        ? 0   // BLE mode: no simulated counts
-        : Math.floor(COUNT_RATE + (Math.random() - 0.5) * 40);
+      const tick = bleIsConnectedRef.current ? 0 : Math.floor(COUNT_RATE + (Math.random() - 0.5) * 40);
 
       if (acqMode === 'PRESET_TIME') {
-        // ── Preset Time: accumulate counts, auto-stop (or repeat for iterations) ──
         setCounts((c) => c + tick);
         setElapsedTime((prev) => {
           const next = prev + 1;
           if (next >= presetTime) {
             clearInterval(intervalRef.current);
-            // Store this cycle's count
             setCounts((finalCount) => {
               iterationResultsRef.current.push({ count: finalCount, refHv: refHvRef.current });
-              const doneCount = iterationResultsRef.current.length;
-              if (doneCount < iterations) {
-                // More iterations to go — auto-restart after a brief pause
+              const done = iterationResultsRef.current.length;
+              if (done < iterations) {
                 setTimeout(() => {
                   setCounts(0);
                   elapsedTimeRef.current = 0;
                   setElapsedTime(0);
-                  setCurrentIteration(doneCount + 1);
-                  if (dHv > 0) {
-                    setHv((currentHv) => Math.min(currentHv + dHv, HV_MAX));
-                  }
+                  setCurrentIteration(done + 1);
+                  if (dHv > 0) setHv((v) => Math.min(v + dHv, HV_MAX));
                   setIterationRestartToken((v) => v + 1);
                 }, 400);
               } else {
-                // All done — compute and display average
                 const total = iterationResultsRef.current.reduce((a, b) => a + b.count, 0);
-                const avg = Math.round(total / doneCount);
-                const completedValue = doneCount > 1 ? avg : finalCount;
+                const avg   = Math.round(total / done);
                 displayedCountsRef.current = avg;
                 setDisplayedCounts(avg);
                 setCurrentIteration(0);
                 setIsRunning(false);
-                queueMeasurement(completedValue);
+                queueMeasurement(done > 1 ? avg : finalCount);
               }
               return finalCount;
             });
@@ -540,273 +406,133 @@ function GMCountingScreen() {
         });
 
       } else if (acqMode === 'CPS') {
-        // ── CPS mode ─────────────────────────────────────────────────────────
         if (bleIsConnectedRef.current) {
-          // BLE drives the display — interval only manages elapsed time & history
-          const cpsValue = displayedCountsRef.current;
-          iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpsValue, refHv: refHvRef.current });
+          iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: displayedCountsRef.current, refHv: refHvRef.current });
           elapsedTimeRef.current += 1;
           setElapsedTime((t) => t + 1);
         } else {
-          // Simulated mode: accumulate tick, snapshot, reset window each second
           windowCountsRef.current += tick;
-          const cpsValue = windowCountsRef.current;
-          displayedCountsRef.current = cpsValue;
-          setDisplayedCounts(cpsValue);
-          iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpsValue, refHv: refHvRef.current });
+          const cps = windowCountsRef.current;
+          displayedCountsRef.current = cps;
+          setDisplayedCounts(cps);
+          iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cps, refHv: refHvRef.current });
           windowCountsRef.current = 0;
           elapsedTimeRef.current += 1;
           setElapsedTime((t) => t + 1);
         }
 
       } else if (acqMode === 'CPM') {
-        // ── CPM mode ─────────────────────────────────────────────────────────
         elapsedTimeRef.current += 1;
         setElapsedTime((t) => t + 1);
-
         if (bleIsConnectedRef.current) {
-          // BLE drives the display — only snapshot to history every 60 s
           windowElapsedRef.current += 1;
           if (windowElapsedRef.current >= 60) {
-            const cpmValue = displayedCountsRef.current;
-            iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpmValue, refHv: refHvRef.current });
+            iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: displayedCountsRef.current, refHv: refHvRef.current });
             windowElapsedRef.current = 0;
           }
         } else {
-          // Simulated mode: accumulate tick, snapshot at 60 s boundary
           windowCountsRef.current += tick;
           windowElapsedRef.current += 1;
           if (windowElapsedRef.current >= 60) {
-            const cpmValue = windowCountsRef.current;
-            displayedCountsRef.current = cpmValue;
-            setDisplayedCounts(cpmValue);
-            iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpmValue, refHv: refHvRef.current });
+            const cpm = windowCountsRef.current;
+            displayedCountsRef.current = cpm;
+            setDisplayedCounts(cpm);
+            iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpm, refHv: refHvRef.current });
             windowCountsRef.current = 0;
             windowElapsedRef.current = 0;
           }
         }
       }
     }, 1000);
-
     return () => clearInterval(intervalRef.current);
-  }, [
-    isRunning,
-    acqMode,
-    presetTime,
-    iterations,
-    iterationRestartToken,
-    label,
-    hv,
-    storeDataMode,
-    outputRoute,
-  ]);
+  }, [isRunning, acqMode, presetTime, iterations, iterationRestartToken, hv, storeDataMode, outputRoute]);
 
-  // ── PROG cycle handler ────────────────────────────────────────────────────
+  // ── PROG ─────────────────────────────────────────────────────────────────
   const handlePROG = () => {
-    if (isRunning || bootStage !== BOOT_READY || dataMode !== DATA_OFF) return;
-    if (progSub === PROG_SHOW_OK) return;
+    if (isRunning || bootStage !== BOOT_READY) return;
+    if (progSub === PROG_SHOW_OK || flashMessage) return;
 
-    // Initial press: enter programming mode
-    if (progSub === PROG_OFF) {
-      beginProgrammingSession();
-      setProgSub(PROG_ACQ_SELECT);
-      return;
-    }
-
-    // From ACQ_SELECT, move to TIME_ADJUST or skip for CPS/CPM
+    if (progSub === PROG_OFF) { beginProgrammingSession(); setProgSub(PROG_ACQ_SELECT); return; }
     if (progSub === PROG_ACQ_SELECT) {
-      if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') {
-        setProgSub(PROG_READINGS_ADJUST);
-        setActiveParamField(PARAM_FIELD_READINGS);
-      } else {
-        setCursorPos(0);
-        setProgSub(PROG_TIME_ADJUST);
-        setActiveParamField(PARAM_FIELD_TIMER);
-      }
+      if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') { setProgSub(PROG_READINGS_ADJUST); setActiveParamField(PARAM_FIELD_READINGS); }
+      else { setCursorPos(0); setProgSub(PROG_TIME_ADJUST); setActiveParamField(PARAM_FIELD_TIMER); }
       return;
     }
-
-    // From TIME_ADJUST, cycle to READINGS_ADJUST
-    if (progSub === PROG_TIME_ADJUST) {
-      setProgSub(PROG_READINGS_ADJUST);
-      setActiveParamField(PARAM_FIELD_READINGS);
+    if (progSub === PROG_TIME_ADJUST)      { setProgSub(PROG_READINGS_ADJUST); setActiveParamField(PARAM_FIELD_READINGS); return; }
+    if (progSub === PROG_READINGS_ADJUST)  {
+      // CPS/CPM skip ITERATION and DHV steps — so they go straight to SET_HV then DATA_STORE
+      if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') setProgSub(PROG_SET_HV);
+      else { setProgSub(PROG_ITERATION_ADJUST); setActiveParamField(PARAM_FIELD_ITERATIONS); }
       return;
     }
-
-    // From READINGS_ADJUST, cycle to LABEL_ASSIGN
-    if (progSub === PROG_READINGS_ADJUST) {
-      setProgSub(PROG_LABEL_ASSIGN);
-      setActiveParamField(PARAM_FIELD_LABEL);
+    if (progSub === PROG_ITERATION_ADJUST) { setProgSub(PROG_SET_HV); return; }
+    if (progSub === PROG_SET_HV)           {
+      if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') setProgSub(PROG_DATA_STORE);
+      else { setProgSub(PROG_DHV_ADJUST); setActiveParamField(PARAM_FIELD_DHV); }
       return;
     }
-
-    // From LABEL_ASSIGN, cycle to ITERATION_ADJUST or skip for CPS/CPM
-    if (progSub === PROG_LABEL_ASSIGN) {
-      if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') {
-        setProgSub(PROG_SAVE_CONFIRM);
-      } else {
-        setProgSub(PROG_ITERATION_ADJUST);
-        setActiveParamField(PARAM_FIELD_ITERATIONS);
-      }
-      return;
-    }
-
-    // From ITERATION_ADJUST, cycle to DHV_ADJUST
-    if (progSub === PROG_ITERATION_ADJUST) {
-      setProgSub(PROG_DHV_ADJUST);
-      setActiveParamField(PARAM_FIELD_DHV);
-      return;
-    }
-
-    // From DHV_ADJUST, move to SAVE_CONFIRM
-    if (progSub === PROG_DHV_ADJUST) {
-      setProgSub(PROG_SAVE_CONFIRM);
-      return;
-    }
-
-    // From SAVE_CONFIRM, discard and exit
-    if (progSub === PROG_SAVE_CONFIRM) {
-      discardProgrammingSession();
-    }
+    if (progSub === PROG_DHV_ADJUST)       { setProgSub(PROG_DATA_STORE); return; }  // data subs first
+    if (progSub === PROG_DATA_STORE)       { setProgSub(PROG_DATA_OUTPUT); return; }  // Export step before recall
+    if (progSub === PROG_DATA_OUTPUT)      { setRecallIndex(storedReadings.length > 0 ? storedReadings.length - 1 : -1); setProgSub(PROG_DATA_RECALL); return; }
+    if (progSub === PROG_DATA_RECALL)      { setProgSub(PROG_DATA_ERASE); return; }
+    if (progSub === PROG_DATA_ERASE)       { setProgSub(PROG_SAVE_CONFIRM); return; }  // SAVE is last
+    if (progSub === PROG_SAVE_CONFIRM)     { discardProgrammingSession(); }            // PROG → discard & exit
   };
 
-  // ── ▲ / ▼ handlers ────────────────────────────────────────────────────────
+  // ── Erase (defined here so handleUp/Down can reference it) ──────────────
+  const handleEraseData = () => {
+    if (progSub !== PROG_DATA_ERASE) return;
+    try {
+      dbRef.current?.runSync('DELETE FROM measurements');
+      dbRef.current?.runSync("DELETE FROM sqlite_sequence WHERE name='measurements';");
+    } catch (err) { console.error('Erase error:', err); }
+    setStoredReadings([]);
+    setPendingMeasurement(null);
+    setRecallIndex(-1);
+    nextSerialNoRef.current = 1;
+    showFlashMessage('MEMORY CLEARED');
+    setProgSub(PROG_OFF);
+  };
+
+  // ── ▲ / ▼ ────────────────────────────────────────────────────────────────
   const handleUp = () => {
-    if (isRunning || bootStage !== BOOT_READY) return;
-
-    if (dataMode === DATA_STORE_MODE) {
-      setStoreDataMode((mode) => (mode === STORE_MODE_AUTO ? STORE_MODE_MANUAL : STORE_MODE_AUTO));
-      return;
-    }
-
-    if (dataMode === DATA_OUTPUT_ROUTE) {
-      setOutputRoute((route) => (route === OUTPUT_ROUTE_USB ? OUTPUT_ROUTE_PRINTER : OUTPUT_ROUTE_USB));
-      return;
-    }
-
-    if (dataMode === DATA_RECALL) {
-      if (storedReadings.length === 0) return;
-      setRecallIndex((index) => Math.min(index + 1, storedReadings.length - 1));
-      return;
-    }
-
-    if (dataMode === DATA_ERASE_CONFIRM) {
-      return;
-    }
-
-    if (dataMode === DATA_MESSAGE) return;
-
-    if (progSub === PROG_ACQ_SELECT) {
-      setDraftAcqMode((m) => {
-        const idx = ACQ_MODE_ORDER.indexOf(m);
-        return ACQ_MODE_ORDER[(idx + 1) % ACQ_MODE_ORDER.length];
-      });
-
-    } else if (progSub === PROG_TIME_ADJUST) {
-      // ▲ → increment digit at cursorPos (0–9 wrap)
-      setDraftDigits((prev) => {
-        const next = [...prev];
-        next[cursorPos] = (next[cursorPos] + 1) % 10;
-        return next;
-      });
-
-    } else if (progSub === PROG_READINGS_ADJUST) {
-      // READINGS is immutable and reflects current MEM count.
-      return;
-
-    } else if (progSub === PROG_LABEL_ASSIGN) {
-      // ▲ → cycle label forward SP → ST → BG → SP
-      setDraftLabel((prev) => {
-        const idx = LABEL_OPTIONS.indexOf(prev);
-        return LABEL_OPTIONS[(idx + 1) % LABEL_OPTIONS.length];
-      });
-
-    } else if (progSub === PROG_ITERATION_ADJUST) {
-      // ▲ → increment iteration count (max 9)
-      setDraftIterations((n) => Math.min(n + 1, 9));
-
-    } else if (progSub === PROG_DHV_ADJUST) {
-      // ▲ → increment dHV by 5 (max 100)
-      setDraftDHv((v) => Math.min(v + 5, 100));
-
-    } else if (progSub === PROG_SAVE_CONFIRM) {
-      commitProgrammingSession();
-    }
+    if (isRunning || bootStage !== BOOT_READY || flashMessage) return;
+    if (progSub === PROG_DATA_STORE)  { setStoreDataMode((m) => m === STORE_MODE_AUTO ? STORE_MODE_MANUAL : STORE_MODE_AUTO); return; }
+    if (progSub === PROG_DATA_OUTPUT) { handleExportDB(); return; }   // ▲ = confirm export
+    if (progSub === PROG_DATA_RECALL) { if (storedReadings.length > 0) setRecallIndex((i) => Math.min(i + 1, storedReadings.length - 1)); return; }
+    if (progSub === PROG_DATA_ERASE)  { handleEraseData(); return; }
+    if (progSub === PROG_SET_HV)      { setHv((v) => Math.min(v + hvStep, 900)); return; }
+    if (progSub === PROG_ACQ_SELECT)       { setDraftAcqMode((m) => ACQ_MODE_ORDER[(ACQ_MODE_ORDER.indexOf(m) + 1) % ACQ_MODE_ORDER.length]); }
+    else if (progSub === PROG_TIME_ADJUST) { setDraftDigits((p) => { const n = [...p]; n[cursorPos] = (n[cursorPos] + 1) % 10; return n; }); }
+    else if (progSub === PROG_ITERATION_ADJUST) { setDraftIterations((n) => Math.min(n + 1, 9)); }
+    else if (progSub === PROG_DHV_ADJUST)       { setDraftDHv((v) => Math.min(v + 5, 100)); }
+    else if (progSub === PROG_SAVE_CONFIRM)     { commitProgrammingSession(); }
   };
 
   const handleDown = () => {
-    if (isRunning || bootStage !== BOOT_READY) return;
-
-    if (dataMode === DATA_STORE_MODE) {
-      setStoreDataMode((mode) => (mode === STORE_MODE_AUTO ? STORE_MODE_MANUAL : STORE_MODE_AUTO));
-      return;
-    }
-
-    if (dataMode === DATA_OUTPUT_ROUTE) {
-      setOutputRoute((route) => (route === OUTPUT_ROUTE_USB ? OUTPUT_ROUTE_PRINTER : OUTPUT_ROUTE_USB));
-      return;
-    }
-
-    if (dataMode === DATA_RECALL) {
-      if (storedReadings.length === 0) return;
-      setRecallIndex((index) => Math.max(index - 1, 0));
-      return;
-    }
-
-    if (dataMode === DATA_ERASE_CONFIRM) {
-      return;
-    }
-
-    if (dataMode === DATA_MESSAGE) return;
-
-    if (progSub === PROG_ACQ_SELECT) {
-      setDraftAcqMode((m) => {
-        const idx = ACQ_MODE_ORDER.indexOf(m);
-        return ACQ_MODE_ORDER[(idx - 1 + ACQ_MODE_ORDER.length) % ACQ_MODE_ORDER.length];
-      });
-
-    } else if (progSub === PROG_TIME_ADJUST) {
-      // ▼ → move cursor one position to the LEFT (wraps 0 → 3)
-      setCursorPos((pos) => (pos === 0 ? 3 : pos - 1));
-
-    } else if (progSub === PROG_READINGS_ADJUST) {
-      // READINGS is immutable and reflects current MEM count.
-      return;
-
-    } else if (progSub === PROG_LABEL_ASSIGN) {
-      // ▼ → cycle label backward SP ← BG ← ST ← SP
-      setDraftLabel((prev) => {
-        const idx = LABEL_OPTIONS.indexOf(prev);
-        return LABEL_OPTIONS[(idx - 1 + LABEL_OPTIONS.length) % LABEL_OPTIONS.length];
-      });
-
-    } else if (progSub === PROG_ITERATION_ADJUST) {
-      // ▼ → decrement iteration count (min 1)
-      setDraftIterations((n) => Math.max(n - 1, 1));
-
-    } else if (progSub === PROG_DHV_ADJUST) {
-      // ▼ → decrement dHV by 5 (min 0)
-      setDraftDHv((v) => Math.max(v - 5, 0));
-
-    } else if (progSub === PROG_SAVE_CONFIRM) {
-      commitProgrammingSession();
-    }
+    if (isRunning || bootStage !== BOOT_READY || flashMessage) return;
+    if (progSub === PROG_DATA_STORE)  { setStoreDataMode((m) => m === STORE_MODE_AUTO ? STORE_MODE_MANUAL : STORE_MODE_AUTO); return; }
+    if (progSub === PROG_DATA_OUTPUT) { setOutputRoute((r) => r === OUTPUT_ROUTE_USB ? OUTPUT_ROUTE_PRINTER : OUTPUT_ROUTE_USB); return; }  // ▼ = toggle route
+    if (progSub === PROG_DATA_RECALL) { if (storedReadings.length > 0) setRecallIndex((i) => Math.max(i - 1, 0)); return; }
+    if (progSub === PROG_DATA_ERASE)  { handleEraseData(); return; }
+    if (progSub === PROG_SET_HV)      { setHv((v) => Math.max(v - hvStep, 300)); return; }
+    if (progSub === PROG_ACQ_SELECT)       { setDraftAcqMode((m) => ACQ_MODE_ORDER[(ACQ_MODE_ORDER.indexOf(m) - 1 + ACQ_MODE_ORDER.length) % ACQ_MODE_ORDER.length]); }
+    else if (progSub === PROG_TIME_ADJUST) { setCursorPos((p) => (p === 0 ? 3 : p - 1)); }
+    else if (progSub === PROG_ITERATION_ADJUST) { setDraftIterations((n) => Math.max(n - 1, 1)); }
+    else if (progSub === PROG_DHV_ADJUST)       { setDraftDHv((v) => Math.max(v - 5, 0)); }
+    else if (progSub === PROG_SAVE_CONFIRM)     { commitProgrammingSession(); }
   };
 
-  // ── SRT / STP ─────────────────────────────────────────────────────────────
+  // ── START / STOP ─────────────────────────────────────────────────────────
   const handleSRT = () => {
-    if (isRunning || bootStage !== BOOT_READY || dataMode !== DATA_OFF) return;
+    if (isRunning || bootStage !== BOOT_READY || progSub !== PROG_OFF || flashMessage) return;
     if (!rearPanelConfigRef.current.powerConnected || !rearPanelConfigRef.current.detectorConnected) {
       Alert.alert('Rear Panel Check', 'Connect +12V adaptor power and the G.M. detector on the MHV socket.');
       return;
     }
-    setCounts(0);
-    displayedCountsRef.current = 0;
-    setDisplayedCounts(0);
-    elapsedTimeRef.current = 0;
-    setElapsedTime(0);
-    windowCountsRef.current = 0;
-    windowElapsedRef.current = 0;
+    setCounts(0); displayedCountsRef.current = 0; setDisplayedCounts(0);
+    elapsedTimeRef.current = 0; setElapsedTime(0);
+    windowCountsRef.current = 0; windowElapsedRef.current = 0;
     iterationResultsRef.current = [];
     setCurrentIteration(iterations > 1 ? 1 : 0);
     programSessionRef.current = null;
@@ -817,1439 +543,1096 @@ function GMCountingScreen() {
   const handleSTP = () => {
     clearInterval(intervalRef.current);
     setIsRunning(false);
-
-    // Continuous modes don't have a natural termination point to stage measurements automatically.
-    // Hitting STP serves as the manual snapshot point for CPS/CPM.
-    if (acqMode === 'CPS' || acqMode === 'CPM') {
-      queueMeasurement(displayedCountsRef.current);
-    }
+    if (acqMode === 'CPS' || acqMode === 'CPM') queueMeasurement(displayedCountsRef.current);
   };
 
-  // ── STORE ─────────────────────────────────────────────────────────────────
+  // ── STORE ────────────────────────────────────────────────────────────────
   const handleSTORE = () => {
-    if (isRunning || bootStage !== BOOT_READY) return;
-
-    if (progSub === PROG_ITERATION_ADJUST) {
-      // Iteration mode only edits count; HV is controlled separately by helipot slider.
-      return;
-    }
-
-    if (progSub !== PROG_OFF) return;
-
-    if (dataMode !== DATA_OFF) {
-      cycleDataMode();
-      return;
-    }
-
+    if (bootStage !== BOOT_READY || isRunning || progSub !== PROG_OFF || flashMessage) return;
     if (storeDataMode === STORE_MODE_MANUAL) {
-      if (!pendingMeasurement) {
-        showDataMessage('NO DATA TO STORE');
-        return;
-      }
-
+      if (!pendingMeasurement) { showFlashMessage('NO DATA TO STORE'); return; }
       appendStoredMeasurement(pendingMeasurement);
       setPendingMeasurement(null);
-      showDataMessage('DATA STORED');
-      return;
+      showFlashMessage('DATA STORED');
+    } else {
+      showFlashMessage('AUTO STORE ENABLED');
     }
-
-    showDataMessage('AUTO STORE ENABLED');
   };
 
-  const handleStoreLongPress = () => {
-    if (isRunning || bootStage !== BOOT_READY || progSub !== PROG_OFF || dataMode === DATA_MESSAGE) return;
-    cycleDataMode();
-  };
-
-  const handleEraseData = () => {
-    if (dataMode !== DATA_ERASE_CONFIRM) return;
-
-    try {
-      const db = dbRef.current;
-      if (!db) throw new Error('Database not initialized');
-      db.runSync('DELETE FROM measurements');
-      db.runSync("DELETE FROM sqlite_sequence WHERE name='measurements';");
-    } catch (err) {
-      console.error('Error erasing database:', err);
-    }
-
-    setStoredReadings([]);
-    setPendingMeasurement(null);
-    setRecallIndex(-1);
-    nextSerialNoRef.current = 1;
-    showDataMessage('MEMORY CLEARED');
-  };
+  // handleEraseData is defined above (before handleUp/handleDown)
 
   const handleExportDB = async () => {
     try {
-      // Flush all pending WAL (Write-Ahead Log) data into the main .db file before
-      // copying it. Without this, recent writes that haven't been checkpointed yet
-      // won't appear in the exported file.
-      if (dbRef.current) {
-        try {
-          dbRef.current.execSync('PRAGMA wal_checkpoint(TRUNCATE);');
-        } catch (e) {
-          console.warn('WAL checkpoint warning:', e);
-        }
-      }
-
-      const dbFileUri = `${FileSystem.documentDirectory}SQLite/${DATABASE_NAME}`;
-      const fileInfo = await FileSystem.getInfoAsync(dbFileUri);
-      
-      if (!fileInfo.exists) {
-        Alert.alert("Export Error", "No database found. Save some data first!");
-        return;
-      }
-
+      if (dbRef.current) { try { dbRef.current.execSync('PRAGMA wal_checkpoint(TRUNCATE);'); } catch (_) {} }
+      const uri  = `${FileSystem.documentDirectory}SQLite/${DATABASE_NAME}`;
+      const info = await FileSystem.getInfoAsync(uri);
+      if (!info.exists) { Alert.alert('Export Error', 'No database found.'); return; }
       if (Platform.OS === 'android') {
-        const permission = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(
+        const perm = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(
           'content://com.android.externalstorage.documents/tree/primary%3ADownload'
         );
-
-        if (permission.granted && permission.directoryUri) {
-          // Delete any existing NP.db in the chosen folder so we always overwrite,
-          // rather than letting SAF auto-suffix it to "NP.db (1)", "NP.db (2)", etc.
+        if (perm.granted && perm.directoryUri) {
           try {
-            const existingFiles = await FileSystem.StorageAccessFramework.readDirectoryAsync(
-              permission.directoryUri
-            );
-            for (const fileUri of existingFiles) {
-              if (fileUri.endsWith(encodeURIComponent(DATABASE_NAME)) || fileUri.endsWith(DATABASE_NAME)) {
-                await FileSystem.deleteAsync(fileUri, { idempotent: true });
-              }
-            }
-          } catch (_) {
-            // Non-fatal — if we can't list/delete, we still attempt the write.
-          }
-
-          const targetFileUri = await FileSystem.StorageAccessFramework.createFileAsync(
-            permission.directoryUri,
-            DATABASE_NAME,
-            'application/x-sqlite3'
-          );
-          const dbBase64 = await FileSystem.readAsStringAsync(dbFileUri, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
-          await FileSystem.writeAsStringAsync(targetFileUri, dbBase64, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
-
-          Alert.alert('Export Complete', `${DATABASE_NAME} saved to selected folder.`);
+            const files = await FileSystem.StorageAccessFramework.readDirectoryAsync(perm.directoryUri);
+            for (const f of files) { if (f.endsWith(DATABASE_NAME)) await FileSystem.deleteAsync(f, { idempotent: true }); }
+          } catch (_) {}
+          const tgt    = await FileSystem.StorageAccessFramework.createFileAsync(perm.directoryUri, DATABASE_NAME, 'application/x-sqlite3');
+          const b64    = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+          await FileSystem.writeAsStringAsync(tgt, b64, { encoding: FileSystem.EncodingType.Base64 });
+          Alert.alert('Export Complete', `${DATABASE_NAME} saved.`);
           return;
         }
       }
-      
-      const canShare = await Sharing.isAvailableAsync();
-      if (canShare) {
-        await Sharing.shareAsync(dbFileUri, {
-          mimeType: 'application/x-sqlite3',
-          dialogTitle: 'Export GM Database',
-          UTI: 'public.database'
-        });
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(uri, { mimeType: 'application/x-sqlite3', dialogTitle: 'Export GM Database', UTI: 'public.database' });
       } else {
-        Alert.alert("Export Error", "Sharing is not available on this device.");
+        Alert.alert('Export Error', 'Sharing not available.');
       }
-    } catch (err) {
-      console.error("Export DB Error:", err);
-      Alert.alert("Export Failed", err.message);
-    }
+    } catch (err) { Alert.alert('Export Failed', err.message); }
   };
 
-  // ── Derived display values ────────────────────────────────────────────────
+  // ── Derived values ────────────────────────────────────────────────────────
   const remainingTime = acqMode === 'PRESET_TIME'
     ? Math.max(presetTime - elapsedTime, 0)
-    : acqMode === 'CPM'
-      ? Math.max(60 - windowElapsedRef.current, 0)  // seconds left in current CPM window
-      : 0;
+    : acqMode === 'CPM' ? Math.max(60 - windowElapsedRef.current, 0) : 0;
 
-  // What to show in the Counts row
-  // Show averaged result when a multi-iteration run has completed
   const displayResult = (acqMode === 'CPS' || acqMode === 'CPM')
     ? displayedCounts
-    : (iterations > 1 && !isRunning && iterationResultsRef.current.length > 0)
-      ? displayedCounts   // averaged value set by the loop
-      : counts;
-  const isBooting = bootStage !== BOOT_READY;
-  const isProgOn = progSub !== PROG_OFF;
-  const isDataModeOn = dataMode !== DATA_OFF;
-  const rearPanelConfig = rearPanelConfigRef.current;
-  const memoryCount = storedReadings.length;
+    : (iterations > 1 && !isRunning && iterationResultsRef.current.length > 0) ? displayedCounts : counts;
+
+  const isBooting      = bootStage !== BOOT_READY;
+  const isProgOn       = progSub !== PROG_OFF;
+  const isDataSubMode  = PROG_DATA_SUBS.includes(progSub);
+  const isProgEditMode = isProgOn && !isDataSubMode && progSub !== PROG_SHOW_OK;
+  const memoryCount    = storedReadings.length;
   const currentRecallEntry = recallIndex >= 0 ? storedReadings[recallIndex] : null;
-  const displayAcqMode = isProgOn ? draftAcqMode : acqMode;
+  const displayAcqMode = isProgEditMode ? draftAcqMode : acqMode;
   const draftPresetTime = digitsToNum(draftDigits);
-  const draftNumberOfReadings = memoryCount;
 
   const formatCounts = (n) => String(n).padStart(6, '0');
   const formatPRTime = (n) => String(n).padStart(4, '0');
-  const formatHV = (n) => typeof n === 'number' ? String(n).padStart(4, '0') : '----';
+  const formatHV4    = (n) => typeof n === 'number' ? String(n).padStart(4, '0') : '----';
 
-  // ── PROG cycle label helpers ──────────────────────────────────────────────
+  // Recall computed values
+  // PRESET_TIME → sum of all iteration counts
+  // CPM → average of all minute counts
+  // CPS → average of all second counts
+  const recallDisplayCount = currentRecallEntry ? (() => {
+    const r = currentRecallEntry.iterationResults || [];
+    if (currentRecallEntry.acqMode === 'PRESET_TIME' && r.length > 0)
+      return r.reduce((a, b) => a + (typeof b === 'object' ? b.count : b), 0);
+    if ((currentRecallEntry.acqMode === 'CPM' || currentRecallEntry.acqMode === 'CPS') && r.length > 0) {
+      const total = r.reduce((a, b) => a + (typeof b === 'object' ? b.count : b), 0);
+      return Math.round(total / r.length);
+    }
+    return currentRecallEntry.value;
+  })() : 0;
+
+  // Average ref HV across all stored iteration results for this record
+  const recallAvgRefHv = currentRecallEntry ? (() => {
+    const r = currentRecallEntry.iterationResults || [];
+    const hvVals = r
+      .map((item) => (typeof item === 'object' ? item.refHv : null))
+      .filter((v) => typeof v === 'number');
+    if (hvVals.length === 0) return currentRecallEntry.hv;  // fall back to stored HV
+    return Math.round(hvVals.reduce((a, b) => a + b, 0) / hvVals.length);
+  })() : null;
+
+  // LCD line 1: SN + PT
+  const snStr = String(Math.max(0, nextSerialNoRef.current - 1)).padStart(4, '0');
+  const ptStr = isRunning ? formatPRTime(remainingTime) : formatPRTime(presetTime);
+
+  // PROG sub-mode icon — full 10-step cycle (SET_HV is 5th now)
+  const progSubIcon =
+    progSub === PROG_ACQ_SELECT        ? '①' : progSub === PROG_TIME_ADJUST     ? '②'
+    : progSub === PROG_READINGS_ADJUST ? '③' : progSub === PROG_ITERATION_ADJUST? '④'
+    : progSub === PROG_SET_HV          ? '⑤' : progSub === PROG_DHV_ADJUST      ? '⑥'
+    : progSub === PROG_DATA_STORE      ? '⑦' : progSub === PROG_DATA_OUTPUT     ? '⑧'
+    : progSub === PROG_DATA_RECALL     ? '⑨' : progSub === PROG_DATA_ERASE      ? '⑩'
+    : progSub === PROG_SAVE_CONFIRM    ? '⑪' : '✓';
+
+  // Hint bar
   const progLabel =
-    isBooting ? 'Boot sequence in progress'
-      : dataMode === DATA_STORE_MODE ? '▲ / ▼  →  Toggle AUTO/MANUAL  ·  STORE → Next'
-        : dataMode === DATA_OUTPUT_ROUTE ? '▲ / ▼  →  Select USB-PC or PRINTER  ·  STORE → Next'
-          : dataMode === DATA_RECALL ? '▲ / ▼  →  Scroll by Sl.No.  ·  STORE → Next'
-            : dataMode === DATA_ERASE_CONFIRM ? 'Press ▲ or ▼ to ERASE memory  ·  STORE → Exit'
-              : dataMode === DATA_MESSAGE ? dataMessage
-                : progSub === PROG_ACQ_SELECT ? '▲ / ▼  →  Select ACQ Mode'
-                  : progSub === PROG_TIME_ADJUST ? '▲ → Increment digit  ·  ▼ → Move cursor left  (Preset Time)'
-                    : progSub === PROG_READINGS_ADJUST ? 'READINGS shows total MEM count (read-only)'
-                      : progSub === PROG_LABEL_ASSIGN ? '▲ / ▼  →  Cycle label  [SP · ST · BG]'
-                        : progSub === PROG_ITERATION_ADJUST ? '▲/▼ set iterations (1-9)'
-                          : progSub === PROG_SAVE_CONFIRM ? 'Press ▲ or ▼ to SAVE  ·  Press PROG to discard'
-                            : progSub === PROG_SHOW_OK ? 'Settings saved!'
-                                : storeDataMode === STORE_MODE_MANUAL
-                                  ? 'STORE saves pending reading  ·  Long press STORE for memory menu'
-                                  : 'Press PROG to enter programming mode  ·  Long press STORE for memory menu';
+    isBooting                          ? 'Boot sequence in progress'
+    : flashMessage                     ? flashMessage
+    : progSub === PROG_ACQ_SELECT      ? '▲ / ▼ → Select ACQ Mode  ·  PROG → Next'
+    : progSub === PROG_TIME_ADJUST     ? '▲ → Increment digit  ·  ▼ → Move cursor  ·  PROG → Next'
+    : progSub === PROG_READINGS_ADJUST ? 'READINGS shows MEM count (read-only)  ·  PROG → Next'
+    : progSub === PROG_ITERATION_ADJUST? '▲/▼ set iterations (1–9)  ·  PROG → Next'
+    : progSub === PROG_DHV_ADJUST      ? '▲/▼ set delta HV step  ·  PROG → Next'
+    : progSub === PROG_SAVE_CONFIRM    ? '▲ or ▼ → SAVE  ·  PROG → Discard & Continue'
+    : progSub === PROG_SHOW_OK         ? 'Settings saved!'
+    : progSub === PROG_DATA_STORE      ? '▲ / ▼ → Toggle AUTO/MANUAL  ·  PROG → Next'
+    : progSub === PROG_DATA_OUTPUT     ? '▲ → EXPORT  ·  ▼ → Change route  ·  PROG → Skip'
+    : progSub === PROG_DATA_RECALL     ? '▲ / ▼ → Scroll records  ·  PROG → Next'
+    : progSub === PROG_DATA_ERASE      ? '▲ or ▼ → CONFIRM ERASE  ·  PROG → Cancel erase'
+    : progSub === PROG_SET_HV          ? `▲ +${hvStep}V  ·  ▼ -${hvStep}V  ·  PROG → Next`
+    : storeDataMode === STORE_MODE_MANUAL
+      ? 'STORE → save pending  ·  PROG → programming mode'
+      : 'PROG → enter programming mode';
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ─── Render ───────────────────────────────────────────────────────────────
   return (
     <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="light-content" backgroundColor="#050d1a" />
+      <StatusBar barStyle="dark-content" backgroundColor={DEVICE_BG} />
 
       <View style={styles.outerPanel}>
 
-        {/* ── Logo ────────────────────────────────────────────────────────── */}
-        <Image
-          source={require('./image.jpeg')}
-          style={styles.logo}
-          resizeMode="contain"
-        />
+        {/* ── Title ─────────────────────────────────────────────────────── */}
+        <Text style={styles.deviceTitle}>G.M COUNTING SYSTEM (AT)</Text>
 
-        {/* ── Title ──────────────────────────────────────────────────────── */}
-        <Text style={[styles.title, { color: '#c8deff' }]}>G.M Counting System</Text>
-
-        {/* ── Status badges ──────────────────────────────────────────────── */}
-        <View style={styles.statusStrip}>
-          {isProgOn && !isBooting && (
-            <View style={[styles.badge, styles.badgeProg]}>
-              <Text style={styles.badgeProgText}>
-                {progSub === PROG_ACQ_SELECT ? 'ACQ SELECT'
-                  : progSub === PROG_TIME_ADJUST ? 'TIME ADJUST'
-                    : progSub === PROG_READINGS_ADJUST ? 'READINGS'
-                      : progSub === PROG_LABEL_ASSIGN ? 'LABEL'
-                        : progSub === PROG_ITERATION_ADJUST ? 'ITERATIONS'
-                          : progSub === PROG_SAVE_CONFIRM ? 'SAVE?'
-                            : 'SAVED ✓'}
-              </Text>
-            </View>
-          )}
-          {isDataModeOn && !isBooting && (
-            <View style={[styles.badge, styles.badgeData]}>
-              <Text style={styles.badgeDataText}>
-                {dataMode === DATA_STORE_MODE ? 'STORE DATA'
-                  : dataMode === DATA_OUTPUT_ROUTE ? 'DATA OUT'
-                    : dataMode === DATA_RECALL ? 'RECALL'
-                      : dataMode === DATA_ERASE_CONFIRM ? 'ERASE?'
-                        : dataMessage}
-              </Text>
-            </View>
-          )}
-          {isRunning && (
-            <View style={[styles.badge, styles.badgeRun]}>
-              <Text style={styles.badgeRunText}>● COUNTING</Text>
-            </View>
-          )}
+        {/* ── Small info row ────────────────────────────────────────────── */}
+        <View style={styles.infoRow}>
+          <Text style={styles.infoChip}>MEM {String(memoryCount).padStart(4, '0')}</Text>
+          <Text style={styles.infoChip}>STORE {storeDataMode}</Text>
+          <Text style={styles.infoChip}>ACQ {ACQ_LABELS[acqMode]}</Text>
+          {isRunning && <Text style={[styles.infoChip, styles.infoChipRun]}>● RUNNING</Text>}
+          {isProgOn  && <Text style={[styles.infoChip, styles.infoChipProg]}>PROG {progSubIcon}</Text>}
         </View>
 
-        <View style={styles.rearStrip}>
-          <Text style={styles.rearText}>DET {rearPanelConfig.detectorInput}</Text>
-          <Text style={styles.rearText}>PWR {rearPanelConfig.powerInput}</Text>
-          <Text style={styles.rearText}>OUT {OUTPUT_ROUTE_LABELS[outputRoute]}</Text>
-          <Text style={styles.rearText}>STORE {storeDataMode}</Text>
-          <Text style={styles.rearText}>MEM {String(memoryCount).padStart(4, '0')}</Text>
+        {/* ── BLE Status Indicator (Premium pill) ───────────────────────── */}
+        <View style={styles.bleRegionOuter}>
+          <View style={[styles.bleRegion, ble.isConnected && styles.bleRegionConnected]}>
+            {ble.isConnected ? (
+              <Text style={[styles.bleRegionText, { color: '#fff', letterSpacing: 2 }]}>◉  CONNECTED</Text>
+            ) : isBleMenuOpen ? (
+              <TouchableOpacity onPress={() => ble.startScan()} activeOpacity={0.7} style={styles.bleRegionTouch}>
+                <Text style={ble.isScanning ? styles.bleRegionTextHighlight : styles.bleRegionTextAction}>
+                  {ble.isScanning ? '◉  SCANNING...' : '▶  START SCAN'}
+                </Text>
+              </TouchableOpacity>
+            ) : (
+              <TouchableOpacity onPress={() => setIsBleMenuOpen(true)} activeOpacity={0.7} style={styles.bleRegionTouch}>
+                <Text style={styles.bleRegionText}>◎  NOT CONNECTED</Text>
+              </TouchableOpacity>
+            )}
+          </View>
         </View>
 
-        {/* BLE panel removed — connection managed on the BLE boot screen */}
+        {/* ── LCD Display ───────────────────────────────────────────────── */}
+        <View style={styles.lcdOuter}>
+          <View style={styles.lcdScreen}>
 
-        {/* ─── Main display + HV slider in a row ─────────────────────────── */}
-        <View style={styles.mainRow}>
-
-          {/* ── LCD Display panel ──────────────────────────────────────────── */}
-          <View style={styles.displayBox}>
-
+            {/* Boot */}
             {isBooting && (
-              <View style={styles.overlayScreen}>
-                <Text style={styles.bootIdentity}>
-                  {bootStage === BOOT_GEIGER ? 'GEIGER COUNTING SYSTEM' : 'NUCLEONIX SYSTEMS'}
+              <View style={styles.lcdOverlay}>
+                <Text style={styles.lcdBootText}>
+                  {bootStage === BOOT_GEIGER ? 'GEIGER COUNTING' : 'NUCLEONIX SYSTEMS'}
                 </Text>
               </View>
             )}
 
-            {!isBooting && dataMode === DATA_STORE_MODE && (
-              <View style={styles.overlayScreen}>
-                <Text style={styles.overlayLine1}>STORE</Text>
-                <Text style={styles.overlayLine2}>DATA MODE</Text>
-                <Text style={styles.memoryValue}>{storeDataMode}</Text>
-                <Text style={styles.overlaySub}>Current route: {OUTPUT_ROUTE_LABELS[outputRoute]}</Text>
-                <Text style={styles.overlaySub}>Pending: {pendingMeasurement ? 'YES' : 'NO'}</Text>
+            {/* Flash message */}
+            {!isBooting && flashMessage !== '' && (
+              <View style={styles.lcdOverlay}>
+                <Text style={styles.lcdFlashText}>{flashMessage}</Text>
               </View>
             )}
 
-            {!isBooting && dataMode === DATA_OUTPUT_ROUTE && (
-              <View style={styles.overlayScreen}>
-                <Text style={styles.overlayLine1}>DATA OUT</Text>
-                <Text style={styles.overlayLine2}>REAR PANEL</Text>
-                <Text style={styles.memoryValue}>{OUTPUT_ROUTE_LABELS[outputRoute]}</Text>
-                
-                <TouchableOpacity 
-                  style={{ marginTop: 12, marginBottom: 8, backgroundColor: '#7c6cc4', paddingVertical: 10, paddingHorizontal: 24, borderRadius: 8 }}
-                  onPress={handleExportDB}
-                  activeOpacity={0.7}
-                >
-                  <Text style={{ color: '#ffffff', fontSize: 18, fontWeight: 'bold' }}>📤 EXPORT DB FILE</Text>
-                </TouchableOpacity>
-
-                <Text style={styles.overlaySub}>Tap button to extract SQLite file to File Explorer</Text>
-                <Text style={styles.overlaySub}>▲ or ▼ to change hardware route</Text>
-              </View>
-            )}
-
-            {!isBooting && dataMode === DATA_RECALL && (
-              <View style={styles.overlayScreen}>
-                <ScrollView contentContainerStyle={{ alignItems: 'center', justifyContent: 'center', flexGrow: 1, paddingVertical: 24 }} style={{ width: '100%' }} persistentScrollbar={true}>
-                  <Text style={styles.overlayLine1}>RECALL</Text>
-                  <Text style={styles.overlayLine2}>DATA</Text>
-                  {currentRecallEntry ? (
-                    <>
-                      <Text style={[styles.memoryValue, { marginTop: 16 }]}>Sl.No. {String(currentRecallEntry.serialNo).padStart(4, '0')}</Text>
-                      <Text style={[styles.overlaySub, { fontSize: 28, fontWeight: '700', color: '#f8fafc', marginVertical: 4 }]}>
-                        Counts: {String(currentRecallEntry.value).padStart(6, '0')} {currentRecallEntry.iterations > 1 ? '(AVG)' : ''}
-                      </Text>
-                      <Text style={[styles.overlaySub, { fontSize: 20, marginBottom: 2 }]}>
-                        {ACQ_LABELS[currentRecallEntry.acqMode]} {currentRecallEntry.acqMode === 'PRESET_TIME' ? `(${currentRecallEntry.presetTime}s)` : ''}  ·  {currentRecallEntry.label}  ·  HV {formatHV(currentRecallEntry.hv)}V
-                      </Text>
-                      <Text style={[styles.overlaySub, { fontSize: 18, marginBottom: 8 }]}>
-                        OUT {OUTPUT_ROUTE_LABELS[currentRecallEntry.outputRoute]}
-                      </Text>
-                      {currentRecallEntry.iterations > 1 && currentRecallEntry.iterationResults && currentRecallEntry.iterationResults.length > 0 && (
-                        <View style={styles.iterTableContainer}>
-                            <View style={styles.iterTableHeader}>
-                              <Text style={styles.iterTableColHeader}>Run</Text>
-                              <Text style={styles.iterTableColHeader}>Ref HV (V)</Text>
-                              <Text style={styles.iterTableColHeader}>Count</Text>
-                            </View>
-                            {currentRecallEntry.iterationResults.map((item, idx) => {
-                              const val = typeof item === 'object' ? item.count : item;
-                              const stepHv = typeof item === 'object' ? (item.refHv || item.hv || currentRecallEntry.hv) : currentRecallEntry.hv;
-
-                              return (
-                                <View key={idx} style={styles.iterTableRow}>
-                                  <Text style={styles.iterTableCol1}>{idx + 1}</Text>
-                                  <Text style={[styles.iterTableCol1, { color: '#fb923c' }]}>{stepHv}</Text>
-                                  <Text style={styles.iterTableCol2}>{String(val).padStart(6, '0')}</Text>
-                                </View>
-                              );
-                            })}
+            {/* ══ BLE DEVICE LIST (inside LCD) ══ */}
+            {!isBooting && flashMessage === '' && isBleMenuOpen && !ble.isConnected && (
+              <View style={[styles.lcdOverlay, { paddingHorizontal: 14, paddingVertical: 8, backgroundColor: '#c8ce1a' }]}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', borderBottomWidth: 2, borderBottomColor: '#8a9000', paddingBottom: 6, marginBottom: 8 }}>
+                  <Text style={{ fontFamily: MONO, fontWeight: '900', fontSize: 15, color: '#2a2e00', letterSpacing: 2 }}>◆ BLE DEVICES</Text>
+                  <TouchableOpacity onPress={() => setIsBleMenuOpen(false)} hitSlop={{top:8,bottom:8,left:8,right:8}}>
+                    <Text style={{ fontFamily: MONO, fontWeight: '900', fontSize: 13, color: '#6a0000', letterSpacing: 1 }}>[ESC]</Text>
+                  </TouchableOpacity>
+                </View>
+                {ble.foundDevices.length === 0 ? (
+                  <Text style={{ fontFamily: MONO, fontSize: 14, color: '#2a2e00', textAlign: 'center', marginTop: 18, opacity: 0.75, letterSpacing: 1 }}>
+                    {ble.isScanning ? 'Scanning for devices...' : 'No devices found.\nTap START SCAN.'}
+                  </Text>
+                ) : (
+                  <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false}>
+                    {ble.foundDevices.map((d, i) => (
+                      <View key={d.id} style={styles.bleDeviceRow}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontFamily: MONO, fontWeight: '900', fontSize: 14, color: '#1a1e00' }} numberOfLines={1}>{i + 1}.  {d.name || 'Unknown'}</Text>
+                          <Text style={{ fontFamily: MONO, fontSize: 11, color: '#4a5000', letterSpacing: 0.5 }} numberOfLines={1}>{d.id || ''}</Text>
                         </View>
-                      )}
-
-                      {(currentRecallEntry.acqMode === 'CPS' || currentRecallEntry.acqMode === 'CPM') && (
-                        <>
-                          <Text style={[styles.overlaySub, { fontSize: 18, marginBottom: 8, color: '#fb923c' }]}>
-                            Duration: {currentRecallEntry.acqMode === 'CPS' 
-                              ? `${currentRecallEntry.presetTime} seconds` 
-                              : `${Math.floor(currentRecallEntry.presetTime / 60)} minutes ${currentRecallEntry.presetTime % 60} seconds`}
-                          </Text>
-
-                          {currentRecallEntry.iterationResults && currentRecallEntry.iterationResults.length > 0 && (
-                            <View style={[styles.iterTableContainer, { marginTop: 4 }]}>
-                                <View style={styles.iterTableHeader}>
-                                  <Text style={styles.iterTableColHeader}>{currentRecallEntry.acqMode === 'CPS' ? 'Second' : 'Minute'}</Text>
-                                  <Text style={styles.iterTableColHeader}>Ref HV</Text>
-                                  <Text style={styles.iterTableColHeader}>Count</Text>
-                                </View>
-                                {currentRecallEntry.iterationResults.map((item, idx) => (
-                                    <View key={idx} style={styles.iterTableRow}>
-                                      <Text style={styles.iterTableCol1}>{item.timeUnit}</Text>
-                                      <Text style={[styles.iterTableCol1, { color: '#fb923c' }]}>{item.refHv || '----'}</Text>
-                                      <Text style={styles.iterTableCol2}>{String(item.count).padStart(6, '0')}</Text>
-                                    </View>
-                                ))}
-                            </View>
-                          )}
-                        </>
-                      )}
-                    </>
-                  ) : (
-                    <Text style={[styles.overlaySub, { marginTop: 16 }]}>No stored readings</Text>
-                  )}
-                </ScrollView>
+                        <TouchableOpacity style={styles.bleConnectBtn} onPress={() => { ble.connectToDevice(d.id); setIsBleMenuOpen(false); }}>
+                          <Text style={styles.bleConnectBtnText}>CONNECT</Text>
+                        </TouchableOpacity>
+                      </View>
+                    ))}
+                  </ScrollView>
+                )}
               </View>
             )}
 
-            {!isBooting && dataMode === DATA_ERASE_CONFIRM && (
-              <View style={styles.overlayScreen}>
-                <Text style={styles.overlayLine1}>ERASE?</Text>
-                <Text style={styles.overlayLine2}>(MEM)</Text>
-                <Text style={styles.overlaySub}>Stored records: {String(memoryCount).padStart(4, '0')}</Text>
-                <TouchableOpacity style={styles.eraseBtn} onPress={handleEraseData} activeOpacity={0.7}>
-                  <Text style={styles.eraseBtnText}>ERASE MEMORY</Text>
-                </TouchableOpacity>
-                <Text style={[styles.overlaySub, { marginTop: 16 }]}>STORE  {'→'}  Exit erase mode</Text>
-              </View>
-            )}
-
-            {!isBooting && dataMode === DATA_MESSAGE && (
-              <View style={styles.overlayScreen}>
-                <Text style={styles.memoryValue}>{dataMessage}</Text>
-              </View>
-            )}
-
-            {/* ══ SAVE? overlay ══ */}
-            {!isBooting && dataMode === DATA_OFF && progSub === PROG_SAVE_CONFIRM && (
-              <View style={styles.overlayScreen}>
-                <Text style={styles.overlayLine1}>SAVE?</Text>
-                <Text style={styles.overlayLine2}>(PRG)</Text>
-                <Text style={styles.overlaySub}>{ACQ_LABELS[draftAcqMode]}</Text>
-                <Text style={styles.overlaySub}>T {formatPRTime(draftPresetTime)} s  ·  R {formatPRTime(draftNumberOfReadings)}</Text>
-                <Text style={styles.overlaySub}>L {draftLabel}  ·  I {draftIterations}</Text>
-                <Text style={styles.overlaySub}>▲ or ▼  →  Confirm Save</Text>
-                <Text style={styles.overlaySub}>PROG  {'→'}  Discard {'&'} Exit</Text>
-              </View>
-            )}
-
-            {/* ══ OK flash overlay ══ */}
-            {!isBooting && dataMode === DATA_OFF && progSub === PROG_SHOW_OK && (
-              <View style={styles.overlayScreen}>
-                <Text style={styles.overlayOK}>OK</Text>
-                <Text style={styles.overlaySub}>Settings saved!</Text>
-              </View>
-            )}
-
-            {/* ══ READINGS_ADJUST screen ══ */}
-            {!isBooting && dataMode === DATA_OFF && progSub === PROG_READINGS_ADJUST && (
-              <View style={{ paddingVertical: 4 }}>
-                <Text style={styles.progEditHeader}>READINGS IN</Text>
-                <View style={styles.progEditRow}>
-                  <Text style={styles.progEditLabel}>REAIN</Text>
-                  <Text style={styles.progEditHv}>{formatPRTime(memoryCount)}</Text>
+            {/* ══ DATA_STORE ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_DATA_STORE && (
+              <View style={styles.lcdOverlay}>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>STORE</Text>
+                  <Text style={styles.lcdPhysRight}>HV</Text>
                 </View>
-                <Text style={styles.overlaySub}>MEM count is read-only</Text>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>{storeDataMode}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                </View>
               </View>
             )}
 
-            {/* ══ LABEL_ASSIGN screen ══ */}
-            {!isBooting && dataMode === DATA_OFF && progSub === PROG_LABEL_ASSIGN && (
-              <View style={styles.overlayScreen}>
-                <Text style={styles.progEditHeader}>LABLE</Text>
-                <View style={styles.labelSelectRow}>
-                  {LABEL_OPTIONS.map((opt) => (
-                    <View key={opt} style={[
-                      styles.labelOption,
-                      draftLabel === opt && styles.labelOptionActive,
-                    ]}>
-                      <Text style={[
-                        styles.labelOptionText,
-                        draftLabel === opt && styles.labelOptionTextActive,
-                      ]}>{opt}</Text>
+            {/* ══ DATA_OUTPUT (EXPORT) ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_DATA_OUTPUT && (
+              <View style={styles.lcdOverlay}>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>EXPORT?</Text>
+                  <Text style={styles.lcdPhysRight}>HV</Text>
+                </View>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>DATA</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                </View>
+              </View>
+            )}
+
+            {/* ══ DATA_RECALL ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_DATA_RECALL && (
+              <View style={styles.lcdOverlay}>
+                {currentRecallEntry ? (
+                  <>
+                    <View style={styles.lcdPhysRow}>
+                      <Text style={styles.lcdPhysLeft}>RECALL</Text>
+                      <Text style={styles.lcdPhysRight}>SP</Text>
                     </View>
-                  ))}
-                </View>
-                <Text style={styles.labelDesc}>{LABEL_NAMES[draftLabel]}</Text>
-                <Text style={styles.overlaySub}>▲ forward  ·  ▼ backward</Text>
+                    <View style={styles.lcdPhysRow}>
+                      <Text style={styles.lcdPhysLeft}>
+                        {String(currentRecallEntry.serialNo).padStart(4, '0')}
+                      </Text>
+                      <Text style={styles.lcdPhysRight}>
+                        {String(recallDisplayCount).padStart(6, '0')}
+                      </Text>
+                    </View>
+                  </>
+                ) : (
+                  <View style={styles.lcdPhysRow}>
+                    <Text style={styles.lcdPhysLeft}>RECALL</Text>
+                    <Text style={styles.lcdPhysRight}>----</Text>
+                  </View>
+                )}
               </View>
             )}
 
-            {/* ══ ITERATION_ADJUST screen ══ */}
-            {!isBooting && dataMode === DATA_OFF && progSub === PROG_ITERATION_ADJUST && (
-              <View style={styles.overlayScreen}>
-                <Text style={styles.progEditHeader}>ITERATION</Text>
-                <View style={styles.iterBoxRow}>
-                  <Text style={[styles.iterValue, styles.iterValueActive]}>{draftIterations}</Text>
-                </View>
-                <Text style={[styles.labelDesc, { marginTop: 4 }]}>
-                  {draftIterations === 1 ? 'Single run' : `Run ×${draftIterations}, display average`}
-                </Text>
-                <Text style={styles.overlaySub}>HV is independent and controlled by helipot slider</Text>
+            {/* ══ DATA_ERASE ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_DATA_ERASE && (
+              <View style={styles.lcdOverlay}>
+                <Text style={[styles.lcdPhysLeft, { fontSize: 34, letterSpacing: 4, textAlign: 'center', width: '100%', marginVertical: 10 }]}>Erase?</Text>
               </View>
             )}
 
-            {/* ══ Single Active Parameter Display (hardware 2-line simulation) ══ */}
+            {/* ══ SET_HV ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_SET_HV && (
+              <View style={styles.lcdOverlay}>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>SET HV</Text>
+                  <Text style={styles.lcdPhysRight}>HV</Text>
+                </View>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>{''}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                </View>
+              </View>
+            )}
+
+            {/* ══ SAVE? ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_SAVE_CONFIRM && (
+              <View style={styles.lcdOverlay}>
+                <Text style={[styles.lcdPhysLeft, { fontSize: 34, letterSpacing: 4, textAlign: 'center', width: '100%', marginVertical: 10 }]}>Save?</Text>
+              </View>
+            )}
+
+            {/* ══ OK ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_SHOW_OK && (
+              <View style={styles.lcdOverlay}>
+                <Text style={[styles.lcdOverlayTitle, { fontSize: 52, letterSpacing: 8 }]}>OK</Text>
+                <Text style={styles.lcdOverlaySub}>Settings saved!</Text>
+              </View>
+            )}
+
+            {/* ══ READINGS_ADJUST ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_READINGS_ADJUST && (
+              <View style={styles.lcdOverlay}>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>READINGS</Text>
+                  <Text style={styles.lcdPhysRight}>HV</Text>
+                </View>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>{formatPRTime(memoryCount)}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                </View>
+              </View>
+            )}
+
+            {/* ══ ITERATION_ADJUST ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_ITERATION_ADJUST && (
+              <View style={styles.lcdOverlay}>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>ITERATION</Text>
+                  <Text style={styles.lcdPhysRight}>HV</Text>
+                </View>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>{'     '}{draftIterations}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                </View>
+              </View>
+            )}
+
+            {/* ══ DHV_ADJUST ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_DHV_ADJUST && (
+              <View style={styles.lcdOverlay}>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>dHV STEP</Text>
+                  <Text style={styles.lcdPhysRight}>HV</Text>
+                </View>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>{`+${draftDHv} V`}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                </View>
+              </View>
+            )}
+
+            {/* ══ ACQ_SELECT ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_ACQ_SELECT && (
+              <View style={styles.lcdOverlay}>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>ACQ MODE</Text>
+                  <Text style={styles.lcdPhysRight}>HV</Text>
+                </View>
+                <View style={styles.lcdPhysRow}>
+                  <Text style={styles.lcdPhysLeft}>{ACQ_LABELS[displayAcqMode]}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                </View>
+              </View>
+            )}
+
+            {/* ══ TIME_ADJUST — 2-line with cursor & HV ══ */}
+            {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_TIME_ADJUST && (
+              <View style={styles.lcdOverlay}>
+                {/* Line 1: PRESET | ^^^^ (aligned to columns) | HV */}
+                <View style={styles.lcdPhysRow}>
+                  <Text style={[styles.lcdPhysLeft, { flex: 0, width: 120 }]}>PRESET</Text>
+                  <View style={{ flex: 1, flexDirection: 'row', justifyContent: 'center' }}>
+                    {[0, 1, 2, 3].map((i) => (
+                      <Text key={`cur-${i}`} style={{ width: 22, textAlign: 'center', fontSize: 26, fontWeight: '900', color: '#0a2a6a', fontFamily: MONO }}>
+                        {i === cursorPos ? '^' : ' '}
+                      </Text>
+                    ))}
+                  </View>
+                  <Text style={styles.lcdPhysRight}>HV</Text>
+                </View>
+                {/* Line 2: TIME  | 0000 (aligned to columns) | XXXX HV value */}
+                <View style={styles.lcdPhysRow}>
+                  <Text style={[styles.lcdPhysLeft, { flex: 0, width: 120 }]}>TIME</Text>
+                  <View style={{ flex: 1, flexDirection: 'row', justifyContent: 'center' }}>
+                    {draftDigits.map((d, i) => (
+                      <Text key={`dig-${i}`} style={{ width: 22, textAlign: 'center', fontSize: 26, fontWeight: '900', color: LCD_TEXT, fontFamily: MONO }}>
+                        {d}
+                      </Text>
+                    ))}
+                  </View>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                </View>
+              </View>
+            )}
+
+            {/* ══ Main 2-line LCD display (PROG_OFF / non-overlay states) ══ */}
             {!isBooting
-              && dataMode === DATA_OFF
+              && flashMessage === ''
+              && !isBleMenuOpen
+              && !isDataSubMode
               && progSub !== PROG_SAVE_CONFIRM
               && progSub !== PROG_SHOW_OK
               && progSub !== PROG_READINGS_ADJUST
-              && progSub !== PROG_LABEL_ASSIGN
-              && progSub !== PROG_ITERATION_ADJUST && (
-                <>
-                  {/* === LINE 1: Count/AVG (always visible) === */}
-                  <View style={styles.displayRow}>
-                    <Text style={styles.displayLabel}>
-                      {acqMode === 'CPM' ? 'CPM :'
-                        : acqMode === 'CPS' ? 'CPS :'
-                          : (iterations > 1 && !isRunning && iterationResultsRef.current.length > 0)
-                            ? 'AVG :'
-                            : 'COUNT :'}
-                    </Text>
-                    <Text style={styles.displayValue}>{formatCounts(displayResult)}</Text>
-                    {currentIteration > 0 && isRunning && (
-                      <Text style={styles.iterChip}>{currentIteration}/{iterations}</Text>
-                    )}
-                  </View>
-
-                  <View style={styles.displayDivider} />
-
-                  {/* === LINE 2: Active Parameter Field (one shown at a time) === */}
-
-                  {/* TIMER - PR.TIME field */}
-                  {progSub === PROG_TIME_ADJUST && (
-                    <View style={{ paddingVertical: 4 }}>
-                      <Text style={styles.progEditHeader}>PRESET</Text>
-                      <View style={styles.progEditRow}>
-                        <Text style={styles.progEditLabel}>TIME</Text>
-                        <View style={styles.digitRow}>
-                          {draftDigits.map((digit, idx) => (
-                            <View key={idx} style={styles.digitCell}>
-                              <Text style={[
-                                styles.cursorArrow,
-                                idx === cursorPos ? styles.cursorArrowActive : styles.cursorArrowHidden,
-                              ]}>▲</Text>
-                              <Text style={[
-                                styles.digitChar,
-                                idx === cursorPos && styles.digitCharActive,
-                              ]}>{digit}</Text>
-                            </View>
-                          ))}
-                        </View>
-                        <Text style={styles.displayUnit}> s</Text>
-                      </View>
-                    </View>
-                  )}
-
-                  {/* READINGS - REAIN field */}
-                  {progSub === PROG_READINGS_ADJUST && (
-                    <View style={{ paddingVertical: 4 }}>
-                      <Text style={styles.progEditHeader}>READINGS IN</Text>
-                      <View style={styles.progEditRow}>
-                        <Text style={styles.progEditLabel}>REAIN</Text>
-                        <Text style={styles.progEditHv}>{formatPRTime(memoryCount)}</Text>
-                      </View>
-                    </View>
-                  )}
-
-                  {/* LABEL - LABLE field */}
-                  {progSub === PROG_LABEL_ASSIGN && (
-                    <View style={styles.overlayScreen}>
-                      <Text style={styles.progEditHeader}>LABLE</Text>
-                      <View style={styles.labelSelectRow}>
-                        {LABEL_OPTIONS.map((opt) => (
-                          <View key={opt} style={[
-                            styles.labelOption,
-                            draftLabel === opt && styles.labelOptionActive,
-                          ]}>
-                            <Text style={[
-                              styles.labelOptionText,
-                              draftLabel === opt && styles.labelOptionTextActive,
-                            ]}>{opt}</Text>
-                          </View>
-                        ))}
-                      </View>
-                      <Text style={styles.labelDesc}>{LABEL_NAMES[draftLabel]}</Text>
-                    </View>
-                  )}
-
-                  {/* ITERATIONS - ITERATION field */}
-                  {progSub === PROG_ITERATION_ADJUST && (
-                    <View style={styles.overlayScreen}>
-                      <Text style={styles.progEditHeader}>ITERATION</Text>
-                      <View style={styles.iterBoxRow}>
-                        <Text style={[styles.iterValue, styles.iterValueActive]}>{draftIterations}</Text>
-                      </View>
-                      <Text style={[styles.labelDesc, { marginTop: 4 }]}>
-                        {draftIterations === 1 ? 'Single run' : `Run ×${draftIterations}, display average`}
-                      </Text>
-                      <View style={styles.iterBoxRow}>
-                        <Text style={styles.progEditLabel}>HV</Text>
-                        <Text style={styles.iterValueSmall}>
-                          {formatHV(hv)} V
-                        </Text>
-                      </View>
-                    </View>
-                  )}
-
-                  {/* dHV - DHV_ADJUST field */}
-                  {progSub === PROG_DHV_ADJUST && (
-                    <View style={styles.overlayScreen}>
-                      <Text style={styles.progEditHeader}>dHV STEP</Text>
-                      <View style={styles.iterBoxRow}>
-                        <Text style={[styles.iterValue, styles.iterValueActive]}>+{draftDHv} V</Text>
-                      </View>
-                      <Text style={[styles.labelDesc, { marginTop: 4 }]}>
-                        {draftDHv === 0 ? 'Constant HV for all runs' : `Increase HV by ${draftDHv}V each run`}
-                      </Text>
-                    </View>
-                  )}
-
-                  {/* When in ACQ_SELECT mode, show a simplified view */}
-                  {progSub === PROG_ACQ_SELECT && (
-                    <View style={styles.overlayScreen}>
-                      <Text style={styles.progEditHeader}>ACQ MODE</Text>
-                      <View style={[
-                        styles.modeTag,
-                        displayAcqMode === 'CPS' && styles.modeTagCPS,
-                        displayAcqMode === 'CPM' && styles.modeTagCPM,
-                        styles.modeTagEditing,
-                      ]}>
-                        <Text style={styles.modeTagText}>{ACQ_LABELS[displayAcqMode]}</Text>
-                      </View>
-                      <Text style={styles.overlaySub}>▲ / ▼ to cycle modes</Text>
-                    </View>
-                  )}
-
-                  {(activeParamField === PARAM_FIELD_ITERATIONS || (progSub === PROG_ITERATION_ADJUST)) && (
-                    <View style={[styles.paramBox, progSub === PROG_ITERATION_ADJUST && styles.paramBoxActive]}>
-                      <Text style={styles.paramLabel}>ITERATIONS</Text>
-                      <Text style={styles.paramValue}>{progSub === PROG_ITERATION_ADJUST ? draftIterations : iterations}</Text>
-                    </View>
-                  )}
-
-                  {(activeParamField === PARAM_FIELD_DHV || (progSub === PROG_DHV_ADJUST)) && (
-                    <View style={[styles.paramBox, progSub === PROG_DHV_ADJUST && styles.paramBoxActive]}>
-                      <Text style={styles.paramLabel}>dHV STEP</Text>
-                      <Text style={styles.paramValue}>+{progSub === PROG_DHV_ADJUST ? draftDHv : dHv}V</Text>
-                    </View>
-                  )}
-
-                  {/* When PROG_OFF (not editing), show the 4 parameters in a clean rotating display based on activeParamField */}
-                  {progSub === PROG_OFF && activeParamField === PARAM_FIELD_TIMER && (
-                    <View style={styles.displayRow}>
-                      <Text style={styles.displayLabel}>PR.TIME :</Text>
-                      {acqMode === 'PRESET_TIME' && !isRunning ? (
-                        <Text style={styles.displayValue}>{formatPRTime(presetTime)}</Text>
-                      ) : (
-                        <Text style={[
-                          styles.displayValue,
-                          acqMode !== 'PRESET_TIME' && styles.displayValueDim,
-                        ]}>{formatPRTime(remainingTime)}</Text>
-                      )}
-                      <Text style={styles.displayUnit}> s</Text>
-                    </View>
-                  )}
-
-                  {progSub === PROG_OFF && activeParamField === PARAM_FIELD_READINGS && (
-                    <View style={styles.displayRow}>
-                      <Text style={styles.displayLabel}>MEM :</Text>
-                      <Text style={styles.displayValue}>
-                        {formatPRTime(memoryCount)}
-                      </Text>
-                    </View>
-                  )}
-
-                  {progSub === PROG_OFF && activeParamField === PARAM_FIELD_LABEL && (
-                    <View style={styles.displayRow}>
-                      <Text style={styles.displayLabel}>LABEL :</Text>
-                      <Text style={[styles.displayValue, { color: '#a78bfa', letterSpacing: 2 }]}>
-                        {label}
-                      </Text>
-                      <Text style={[styles.displayUnit, { color: '#7c6cc4' }]}>
-                        {'  '}{LABEL_NAMES[label]}
-                      </Text>
-                    </View>
-                  )}
-
-                  {progSub === PROG_OFF && activeParamField === PARAM_FIELD_ITERATIONS && (
-                    <View style={styles.displayRow}>
-                      <Text style={styles.displayLabel}>ITERATIONS :</Text>
-                      <Text style={styles.displayValue}>{iterations}</Text>
-                      {iterations > 1 && (
-                        <Text style={[styles.displayUnit, { color: '#38bdf8' }]}>{' '}avg</Text>
-                      )}
-                    </View>
-                  )}
-
-                  <View style={styles.displayDivider} />
-
-                  {/* === LINE 3: HV (always visible at bottom) === */}
-                  <View style={styles.displayRow}>
-                    <Text style={[
-                      styles.playIndicator,
-                      isRunning && styles.playIndicatorActive,
-                    ]}>▶</Text>
-                    <Text style={styles.displayLabel}>Ref HV :</Text>
-                    <Text style={styles.displayValue}>
-                      ----
-                    </Text>
-                    <Text style={styles.displayUnit}> V</Text>
-                  </View>
-                </>
-              )}
-
-          </View>
-
-          {/* ── HV Helipot Slider ───────────────────────────────────────────── */}
-          <HVSlider hv={hv} setHv={setHv} disabled={isRunning || isBooting || isDataModeOn} hvStep={hvStep} setHvStep={setHvStep} />
-        </View>
-
-        {/* ── Button grid ────────────────────────────────────────────────── */}
-        <View style={styles.buttonGrid}>
-
-          {/* Row 1 */}
-          <View style={styles.buttonRow}>
-            <TouchableOpacity
-              style={[styles.btn, isProgOn && styles.btnProgActive]}
-              onPress={handlePROG}
-              activeOpacity={0.7}>
-              <Text style={[styles.btnText, isProgOn && styles.btnTextProg]}>PROG</Text>
-              {isProgOn && (
-                <Text style={styles.progSubLabel}>
-                  {progSub === PROG_ACQ_SELECT ? '①'
-                    : progSub === PROG_TIME_ADJUST ? '②'
-                      : progSub === PROG_READINGS_ADJUST ? '③'
-                        : progSub === PROG_LABEL_ASSIGN ? '④'
-                          : progSub === PROG_ITERATION_ADJUST ? '⑤'
-                            : progSub === PROG_DHV_ADJUST ? '⑥'
-                              : progSub === PROG_SAVE_CONFIRM ? '⑦'
-                                : '✓'}
+              && progSub !== PROG_ITERATION_ADJUST
+              && progSub !== PROG_DHV_ADJUST
+              && progSub !== PROG_ACQ_SELECT
+              && progSub !== PROG_SET_HV
+              && progSub !== PROG_TIME_ADJUST && (
+              <View style={styles.lcdMainContent}>
+                {/* LINE 1: ET+PT (running) or SN+PT (idle) */}
+                <Text style={styles.lcdLine}>
+                  {isRunning
+                    ? `ET${formatPRTime(elapsedTime)}  PT${formatPRTime(presetTime)}${blinkOn ? ' A' : '  '}`
+                    : `SN${snStr}  PT${ptStr}`}
                 </Text>
-              )}
-            </TouchableOpacity>
+                {/* LINE 2: HV + COUNT */}
+                <Text style={styles.lcdLine}>
+                  {`HV${formatHV4(hv)}  ${formatCounts(displayResult)}`}
+                </Text>
+                {/* Sub-info line: mode + iteration */}
+                <View style={styles.lcdSubRow}>
+                  <Text style={styles.lcdSubText}>{ACQ_LABELS[acqMode]}</Text>
+                  {currentIteration > 0 && isRunning && (
+                    <Text style={styles.lcdSubText}> · Run {currentIteration}/{iterations}</Text>
+                  )}
+                </View>
+              </View>
+            )}
 
-            <TouchableOpacity
-              style={[styles.btn, styles.btnArrow]}
-              onPress={handleUp}
-              activeOpacity={0.7}>
-              <Text style={styles.arrowText}>▲</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.btn, isRunning ? styles.btnDisabled : styles.btnSRT]}
-              onPress={handleSRT}
-              disabled={isRunning}
-              activeOpacity={0.7}>
-              <Text style={[styles.btnText, styles.btnSRTText]}>SRT</Text>
-            </TouchableOpacity>
           </View>
-
-          {/* Row 2 */}
-          <View style={styles.buttonRow}>
-            <TouchableOpacity
-              style={[styles.btn, isDataModeOn && styles.btnStoreActive]}
-              onPress={handleSTORE}
-              onLongPress={handleStoreLongPress}
-              activeOpacity={0.7}>
-              <Text style={styles.btnText}>STORE</Text>
-              <Text style={styles.progSubLabel}>{storeDataMode}</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.btn, styles.btnArrow]}
-              onPress={handleDown}
-              activeOpacity={0.7}>
-              <Text style={styles.arrowText}>▼</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={[styles.btn, styles.btnSTP]}
-              onPress={handleSTP}
-              activeOpacity={0.7}>
-              <Text style={[styles.btnText, styles.btnSTPText]}>STP</Text>
-            </TouchableOpacity>
-          </View>
-
         </View>
 
-        {/* ── Hint bar ───────────────────────────────────────────────────── */}
-        <Text style={styles.hintText}>{progLabel}</Text>
+        {/* ── Button Panel (dark blue panel matching physical device) ─────── */}
+        <View style={styles.buttonPanelWrapper}>
+          <View style={styles.buttonGrid}>
+
+            {/* Row 1: STORE | ▲ | START */}
+            <View style={styles.buttonRow}>
+              <TouchableOpacity style={styles.btn} onPress={handleSTORE} activeOpacity={0.75}>
+                <Text style={styles.btnText}>STORE</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity style={styles.btn} onPress={handleUp} activeOpacity={0.75}>
+                <Text style={styles.arrowChar}>▲</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity style={styles.btn} onPress={handleSRT} disabled={isRunning} activeOpacity={0.75}>
+                <Text style={styles.btnText}>START</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Row 2: PROG | ▼ | STOP */}
+            <View style={styles.buttonRow}>
+              <TouchableOpacity
+                style={[styles.btn, isProgEditMode && styles.btnProgActive]}
+                onPress={handlePROG}
+                activeOpacity={0.75}
+              >
+                <Text style={[styles.btnText, isProgOn && styles.btnTextProg]}>PROG</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity style={styles.btn} onPress={handleDown} activeOpacity={0.75}>
+                <Text style={styles.arrowChar}>▼</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity style={styles.btn} onPress={handleSTP} activeOpacity={0.75}>
+                <Text style={styles.btnText}>STOP</Text>
+              </TouchableOpacity>
+            </View>
+
+          </View>
+        </View>
+
+
+        {/* ── Bottom bar ────────────────────────────────────────────────── */}
+        <View style={styles.bottomBar}>
+          <Text style={styles.brandText}>NUCLEONIX 🅽</Text>
+          <Text style={styles.hintText}>{progLabel}</Text>
+          <Text style={styles.modelText}>GC 602A</Text>
+        </View>
 
       </View>
     </SafeAreaView>
   );
 }
 
-// ─── HV Helipot Slider Component ─────────────────────────────────────────────
-/**
- * Simulates the physical helipot knob from the manual.
- * Drag right  → increase HV (clockwise rotation)
- * Drag left   → decrease HV (counter-clockwise)
- */
-function HVSlider({ hv, setHv, disabled, hvStep, setHvStep }) {
-  const [hvInput, setHvInput] = useState(String(hv));
+// ─── Design Tokens ────────────────────────────────────────────────────────────
+// Physical device color palette
+const DEVICE_BG   = '#7898b0';   // light steel-blue body (like the aluminum casing)
+const FACE_PANEL  = '#6a8298';   // slightly darker face plate
+const LABEL_TEXT  = '#0a1825';   // dark text on light panel background
+const HINT_TEXT   = '#2a4050';   // medium dark for hint text
 
-  useEffect(() => {
-    setHvInput(String(hv));
-  }, [hv]);
+// LCD — bright positive display (yellow-green backlit, dark characters)
+const LCD_OUTER   = '#2a2a10';   // dark LCD frame border
+const LCD_BG      = '#c8d400';   // bright yellow-green LCD background
+const LCD_TEXT    = '#1a1a00';   // very dark yellow-tint text
+const LCD_LABEL   = '#3a3a10';   // slightly lighter label text
 
-  const clampHv = (value) => Math.max(HV_MIN, Math.min(HV_MAX, value));
+// Button panel (dark navy blue matching physical device button section)
+const BTN_PANEL   = '#3b7782';   // dark teal face panel
+const BTN_BG      = '#162848';   // button background
+const BTN_BORDER  = '#e0f0ff';   // button border directly around button
+const BTN_TEXT    = '#e0f0ff';   // near-white button text
 
-  const applyHvInput = () => {
-    const parsed = Number.parseInt(hvInput, 10);
-    if (Number.isNaN(parsed)) {
-      setHvInput(String(hv));
-      return;
-    }
-    const next = clampHv(parsed);
-    setHv(next);
-    setHvInput(String(next));
-  };
-
-  const jumpHv = (delta) => {
-    if (disabled) return;
-    setHv((v) => clampHv(v + delta));
-  };
-
-  return (
-    <View style={styles.sliderContainer}>
-      <Text style={styles.sliderTitle}>SET HV</Text>
-      <Text style={styles.sliderTitle}>CONTROL</Text>
-
-      {/* Knob label */}
-      <View style={styles.knobRing}>
-        <Text style={styles.knobValue}>{hv}</Text>
-        <Text style={styles.knobUnit}>V</Text>
-      </View>
-
-      <TextInput
-        style={[styles.hvInput, disabled && styles.hvInputDisabled]}
-        value={hvInput}
-        onChangeText={setHvInput}
-        onEndEditing={applyHvInput}
-        onSubmitEditing={applyHvInput}
-        keyboardType="numeric"
-        editable={!disabled}
-        maxLength={4}
-        placeholder="HV"
-        placeholderTextColor="#6b7f99"
-      />
-
-      <View style={styles.sliderLabels}>
-        <Text style={styles.sliderEdge}>◄ CCW</Text>
-        <Text style={styles.sliderEdge}>CW ►</Text>
-      </View>
-
-      {/* ── HV jump controls ───────────────────────────────── */}
-      <Text style={styles.stepLabel}>SETTING</Text>
-      <View style={styles.stepRow}>
-        <TouchableOpacity
-          style={styles.stepBtn}
-          onPress={applyHvInput}
-          disabled={disabled}
-          activeOpacity={0.7}
-        >
-          <Text style={styles.stepBtnText}>SET HV</Text>
-        </TouchableOpacity>
-      </View>
-
-      <Text style={styles.sliderHint}>
-        {disabled ? 'HV locked during boot/count/program/data' : `Apply typed HV value`}
-      </Text>
-    </View>
-  );
-}
+const PROG_COLOR  = '#60a5fa';   // PROG mode highlight (blue)
+const MONO        = 'monospace';
 
 // ─── Styles ──────────────────────────────────────────────────────────────────
-const CREAM = '#050d1a';   // deep space navy
-const PANEL_BG = '#0c1829'; // midnight blue
-const BORDER = '#1e4d8c';   // steel blue
-const DISPLAY_BG = '#071220'; // near-black navy LCD
-const GO_COLOR = '#22c55e';   // bright green SRT
-const STOP_COLOR = '#ef4444'; // bright red STP
-const PROG_COLOR = '#60a5fa'; // sky blue PROG
-const TEXT_DARK = '#e2eaf8';  // light steel text
-const TEXT_MID = '#93b4d4';   // muted blue text
-const MONO = 'monospace';
-
 const styles = StyleSheet.create({
+
   safeArea: {
     flex: 1,
-    backgroundColor: CREAM,
+    backgroundColor: DEVICE_BG,
     alignItems: 'center',
     justifyContent: 'center',
   },
 
   outerPanel: {
-    width: '98%',
+    width: '80%',
     flex: 0.98,
-    maxWidth: 1600,
-    backgroundColor: PANEL_BG,
-    borderWidth: 3,
-    borderColor: BORDER,
-    borderRadius: 6,
-    paddingVertical: 12,
-    paddingHorizontal: 20,
+    maxWidth: 820,
+    backgroundColor: FACE_PANEL,
+    borderRadius: 4,
+    paddingVertical: 14,
+    paddingHorizontal: 22,
     justifyContent: 'space-between',
     alignItems: 'center',
+    // Subtle inner shadow to simulate a recessed face plate
     shadowColor: '#000',
-    shadowOffset: { width: 3, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 8,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
+    elevation: 6,
   },
 
-  logo: {
-    width: 200,
-    height: 60,
-    alignSelf: 'center',
-    marginBottom: 4,
-  },
-
-  title: {
-    fontSize: 32,
+  // ── Title ─────────────────────────────────────────────────────────────────
+  deviceTitle: {
+    fontSize: 26,
     fontWeight: '700',
-    color: TEXT_DARK,
-    letterSpacing: 1.2,
+    color: LABEL_TEXT,
+    letterSpacing: 3,
     textAlign: 'center',
-    marginBottom: 4,
-    fontFamily: 'serif',
+    fontFamily: MONO,
+    marginBottom: 6,
   },
 
-  // ── Status strip ──────────────────────────────────────────────────────────
-  statusStrip: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 10,
-    height: 28,
-    marginBottom: 8,
-  },
-  badge: {
-    borderWidth: 1,
-    borderRadius: 4,
-    paddingHorizontal: 10,
-    justifyContent: 'center',
-  },
-  badgeProg: { backgroundColor: '#1e3a6a55', borderColor: PROG_COLOR },
-  badgeProgText: { color: PROG_COLOR, fontWeight: '700', fontSize: 16, letterSpacing: 0.8 },
-  badgeData: { backgroundColor: '#3f2a0f66', borderColor: '#f59e0b' },
-  badgeDataText: { color: '#fbbf24', fontWeight: '700', fontSize: 16, letterSpacing: 0.8 },
-  badgeRun: { backgroundColor: '#14532d55', borderColor: GO_COLOR },
-  badgeRunText: { color: GO_COLOR, fontWeight: '700', fontSize: 16 },
-  rearStrip: {
+  // ── Info row (small chips) ────────────────────────────────────────────────
+  infoRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     justifyContent: 'center',
-    gap: 12,
-    marginBottom: 14,
+    gap: 8,
+    marginBottom: 10,
   },
-  rearText: {
-    fontSize: 16,
-    color: '#9cc6ea',
+  infoChip: {
+    fontSize: 12,
+    color: '#2a4050',
     fontFamily: MONO,
     borderWidth: 1,
-    borderColor: '#1e4d8c55',
-    borderRadius: 4,
+    borderColor: '#4a6888',
+    borderRadius: 3,
     paddingHorizontal: 8,
     paddingVertical: 3,
-    backgroundColor: '#071220',
+    backgroundColor: '#5a7890',
   },
+  infoChipActive: { backgroundColor: '#1a4060', borderColor: '#7ab8e8', color: '#c8e8ff' },
+  infoChipRun:    { backgroundColor: '#1a4020', borderColor: '#3a8040', color: '#c8ffc8' },
+  infoChipProg:   { backgroundColor: '#1a2a5a', borderColor: PROG_COLOR, color: '#a0c8ff' },
 
-  // ── Main row (display + slider side by side) ──────────────────────────────
-  mainRow: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 20,
-    marginBottom: 12,
-  },
-
-  // ── Display box ───────────────────────────────────────────────────────────
-  displayBox: {
-    flex: 1,
-    backgroundColor: DISPLAY_BG,
-    borderWidth: 2.5,
-    borderColor: BORDER,
-    borderRadius: 4,
-    paddingVertical: 12,
-    paddingHorizontal: 24,
-  },
-  displayRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 4,
-    minHeight: 44,
-  },
-  displayDivider: {
-    height: 2,
-    backgroundColor: '#1e4d8c66',
-    marginVertical: 4,
-  },
-  displayLabel: {
-    fontSize: 26,
-    fontWeight: '600',
-    color: '#7ab8e8',
-    width: 160,
-    fontFamily: MONO,
-  },
-  displayValue: {
-    fontSize: 34,
-    fontWeight: '700',
-    color: '#e2eaf8',
-    letterSpacing: 4,
-    fontFamily: MONO,
-  },
-  displayValueDim: {
-    color: '#888',
-  },
-  displayValueEditing: {
-    color: PROG_COLOR,
-  },
-  timeInput: {
-    fontSize: 34,
-    fontWeight: '700',
-    color: '#e2eaf8',
-    letterSpacing: 4,
-    fontFamily: MONO,
-    minWidth: 100,
-    borderBottomWidth: 3,
-    borderBottomColor: PROG_COLOR,
-    paddingVertical: 4,
-    paddingHorizontal: 6,
-  },
-  displayUnit: {
-    fontSize: 22,
-    color: '#7ab8e8',
-    fontFamily: MONO,
-    marginLeft: 6,
-  },
-  playIndicator: {
-    fontSize: 24,
-    color: '#aaa',
-    width: 32,
-    fontFamily: MONO,
-  },
-  playIndicatorActive: {
-    color: GO_COLOR,
-  },
-
-  // ── ACQ mode tag ──────────────────────────────────────────────────────────
-  modeTag: {
-    backgroundColor: '#0f3460',
-    borderWidth: 2,
-    borderColor: '#2a6abf',
-    borderRadius: 6,
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-  },
-  modeTagCPS: { backgroundColor: '#0f2d50', borderColor: '#3a7adf' },
-  modeTagCPM: { backgroundColor: '#1a2a50', borderColor: '#5a8adf' },
-  modeTagEditing: { borderColor: PROG_COLOR, borderWidth: 3 },
-  modeTagText: {
-    fontSize: 24,
-    fontWeight: '800',
-    color: '#c8e0ff',
-    letterSpacing: 1,
-    fontFamily: MONO,
-  },
-
-  // ── HV Slider ─────────────────────────────────────────────────────────────
-  sliderContainer: {
-    width: 220,
-    alignItems: 'center',
-    backgroundColor: '#0c1e3a',
-    borderWidth: 2.5,
-    borderColor: BORDER,
-    borderRadius: 8,
-    paddingVertical: 12,
-    paddingHorizontal: 12,
-  },
-  sliderTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#7ab8e8',
-    letterSpacing: 1.2,
-    textAlign: 'center',
-  },
-  knobRing: {
-    width: 100,
-    height: 100,
-    borderRadius: 50,
-    backgroundColor: '#1a3a6a',
+  // ── LCD Outer (bezel / frame) ─────────────────────────────────────────────
+  lcdOuter: {
+    width: '100%',
     borderWidth: 4,
-    borderColor: '#3a7abf',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginVertical: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 2, height: 2 },
+    borderColor: LCD_OUTER,
+    borderRadius: 4,
+    marginBottom: 12,
+    // Glow effect simulating backlit LCD
+    shadowColor: '#c8d400',
+    shadowOffset: { width: 0, height: 0 },
     shadowOpacity: 0.5,
-    shadowRadius: 4,
-    elevation: 5,
-  },
-  knobValue: {
-    fontSize: 28,
-    fontWeight: '900',
-    color: '#e2eaf8',
-    fontFamily: MONO,
-  },
-  knobUnit: {
-    fontSize: 18,
-    color: '#7ab8e8',
-    fontFamily: MONO,
-  },
-  sliderLabels: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    width: '100%',
-    marginTop: 6,
-    paddingHorizontal: 4,
-  },
-  sliderEdge: {
-    fontSize: 14,
-    color: '#7ab8e8',
-    fontWeight: '700',
-  },
-  sliderHint: {
-    marginTop: 6,
-    fontSize: 12,
-    color: '#5a8abf',
-    fontStyle: 'italic',
-    textAlign: 'center',
-  },
-  hvInput: {
-    width: '100%',
-    marginTop: 8,
-    borderWidth: 2,
-    borderColor: '#2a6abf',
-    borderRadius: 8,
-    backgroundColor: '#081324',
-    color: '#e2eaf8',
-    fontFamily: MONO,
-    fontSize: 24,
-    fontWeight: '700',
-    textAlign: 'center',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-  },
-  hvInputDisabled: {
-    backgroundColor: '#1f2937',
-    color: '#9ca3af',
-    borderColor: '#475569',
+    shadowRadius: 10,
+    elevation: 6,
   },
 
-  // ── HV Step toggle ────────────────────────────────────────────────────────
-  stepLabel: {
-    marginTop: 6,
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#7ab8e8',
-    letterSpacing: 0.8,
-    textAlign: 'center',
-  },
-  stepRow: {
-    flexDirection: 'row',
-    gap: 6,
-    marginTop: 4,
-  },
-  stepBtn: {
-    flex: 1,
-    paddingVertical: 6,
-    borderWidth: 1.5,
-    borderColor: '#1e4d8c',
-    borderRadius: 4,
-    backgroundColor: '#0a1628',
-    alignItems: 'center',
-  },
-  stepBtnActive: {
-    backgroundColor: '#1e3a6a',
-    borderColor: '#60a5fa',
-  },
-  stepBtnText: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#7ab8e8',
-  },
-  stepBtnTextActive: {
-    color: '#60a5fa',
-  },
-
-  // ── Button grid ───────────────────────────────────────────────────────────
-  buttonGrid: {
-    width: '100%',
-    gap: 10,
-  },
-  buttonRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 14,
-  },
-  btn: {
-    flex: 1,
-    height: 70,
-    backgroundColor: '#0f2040',
-    borderWidth: 2.5,
-    borderColor: '#1e4d8c',
-    borderRadius: 4,
-    alignItems: 'center',
+  lcdScreen: {
+    backgroundColor: LCD_BG,
+    height: 170,
+    paddingVertical: 10,
+    paddingHorizontal: 18,
     justifyContent: 'center',
-    shadowColor: '#3a7abf',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.4,
-    shadowRadius: 3,
-    elevation: 4,
-  },
-  btnText: {
-    fontSize: 26,
-    fontWeight: '800',
-    color: TEXT_DARK,
-    letterSpacing: 1.4,
-  },
-  btnArrow: { flex: 0.65 },
-  arrowText: { fontSize: 32, color: '#c8deff', fontWeight: '900' },
-
-  btnProgActive: { backgroundColor: '#1a3460', borderColor: PROG_COLOR },
-  btnStoreActive: { backgroundColor: '#5b3a10', borderColor: '#f59e0b' },
-  btnTextProg: { color: PROG_COLOR },
-  progSubLabel: { fontSize: 18, color: PROG_COLOR, fontWeight: '700' },
-
-  btnSRT: { backgroundColor: '#14532d', borderColor: GO_COLOR },
-  btnSRTText: { color: GO_COLOR, fontWeight: '900' },
-
-  btnSTP: { backgroundColor: '#7f1d1d', borderColor: STOP_COLOR },
-  btnSTPText: { color: '#fca5a5', fontWeight: '900' },
-
-  btnDisabled: { backgroundColor: '#0a1628', borderColor: '#1e3a5f', opacity: 0.45 },
-
-  hintText: {
-    marginTop: 8,
-    fontSize: 18,
-    color: '#5a8abf',
-    letterSpacing: 0.4,
-    fontStyle: 'italic',
+    overflow: 'hidden',
   },
 
-  // ── Preset Time digit-editor UI ────────────────────────────────────────────────
-  progEditHeader: {
-    fontSize: 24,
-    fontWeight: '800',
-    color: '#7ab8e8',
-    letterSpacing: 2,
-    fontFamily: 'monospace',
-    marginBottom: 4,
+  // ── Main 2-line LCD content ───────────────────────────────────────────────
+  lcdMainContent: {
+    justifyContent: 'center',
   },
-  progEditRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginVertical: 4,
-  },
-  progEditLabel: {
-    fontSize: 28,
-    fontWeight: '700',
-    color: '#7ab8e8',
-    fontFamily: 'monospace',
-    width: 90,
-  },
-  progEditHv: {
+  lcdLine: {
     fontSize: 32,
     fontWeight: '700',
-    color: '#e2eaf8',
-    letterSpacing: 3,
-    fontFamily: 'monospace',
+    color: LCD_TEXT,
+    fontFamily: MONO,
+    letterSpacing: 2,
+    lineHeight: 42,
+  },
+  lcdSubRow: {
+    flexDirection: 'row',
+    marginTop: 4,
+  },
+  lcdSubText: {
+    fontSize: 14,
+    color: LCD_LABEL,
+    fontFamily: MONO,
+    fontWeight: '600',
+    letterSpacing: 0.5,
   },
 
-  // Digit cells
+  // ── LCD Overlays (shown during PROG modes) ────────────────────────────────
+  lcdOverlay: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: '100%',
+    paddingVertical: 10,
+    overflow: 'hidden',
+  },
+
+  // ── Physical 2-line LCD row layout (matches GC-602A display exactly) ────
+  // Line 1: LABEL (left)          HV (right)
+  // Line 2: VALUE (left)        XXXX (right)
+  lcdPhysRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-end',
+    width: '100%',
+    paddingHorizontal: 14,
+    paddingVertical: 2,
+  },
+  lcdPhysLeft: {
+    fontSize: 26,
+    fontWeight: '900',
+    color: LCD_TEXT,
+    fontFamily: MONO,
+    letterSpacing: 2,
+    flex: 1,
+  },
+  lcdPhysRight: {
+    fontSize: 26,
+    fontWeight: '900',
+    color: LCD_TEXT,
+    fontFamily: MONO,
+    letterSpacing: 2,
+    textAlign: 'right',
+  },
+
+  lcdBootText: {
+    fontSize: 30,
+    fontWeight: '900',
+    color: LCD_TEXT,
+    fontFamily: MONO,
+    letterSpacing: 2,
+    textAlign: 'center',
+  },
+  lcdFlashText: {
+    fontSize: 28,
+    fontWeight: '900',
+    color: LCD_TEXT,
+    fontFamily: MONO,
+    letterSpacing: 2,
+    textAlign: 'center',
+  },
+  lcdOverlayTitle: {
+    fontSize: 26,
+    fontWeight: '900',
+    color: '#3a2000',    // dark amber on bright LCD
+    fontFamily: MONO,
+    letterSpacing: 4,
+    marginBottom: 4,
+  },
+  lcdOverlayValue: {
+    fontSize: 36,
+    fontWeight: '900',
+    color: LCD_TEXT,
+    fontFamily: MONO,
+    letterSpacing: 3,
+    marginVertical: 4,
+  },
+  lcdOverlaySub: {
+    fontSize: 16,
+    color: LCD_LABEL,
+    fontFamily: MONO,
+    marginTop: 3,
+    textAlign: 'center',
+  },
+
+  // ── Digit editor (TIME_ADJUST) ────────────────────────────────────────────
   digitRow: {
     flexDirection: 'row',
-    gap: 6,
+    alignItems: 'flex-end',
+    marginTop: 6,
   },
-  digitCell: {
-    alignItems: 'center',
-    width: 44,
-  },
-  cursorArrow: {
-    fontSize: 20,
-    fontWeight: '900',
-    height: 20,
-    lineHeight: 20,
-  },
-  cursorArrowActive: {
-    color: '#60a5fa',        // PROG_COLOR
-  },
-  cursorArrowHidden: {
-    color: 'transparent',
-  },
+  digitCell: { alignItems: 'center', width: 46 },
+  digitCursor:       { fontSize: 18, fontWeight: '900', height: 22, lineHeight: 22 },
+  digitCursorActive: { color: '#0a2a60' },
+  digitCursorHidden: { color: 'transparent' },
   digitChar: {
     fontSize: 46,
     fontWeight: '900',
-    color: '#e2eaf8',
-    fontFamily: 'monospace',
-    letterSpacing: 0,
+    color: LCD_TEXT,
+    fontFamily: MONO,
   },
-  digitCharActive: {
-    color: '#60a5fa',        // PROG_COLOR highlight
-    textShadowColor: '#60a5fa55',
-    textShadowRadius: 6,
-    textShadowOffset: { width: 0, height: 0 },
+  digitCharActive: { color: '#0a2a6a' },
+  digitUnit: {
+    fontSize: 24,
+    color: LCD_LABEL,
+    fontFamily: MONO,
+    marginBottom: 6,
+    marginLeft: 6,
   },
 
-  // ── Overlay screens (SAVE? / OK) ───────────────────────────────────────────
-  overlayScreen: {
-    flex: 1,
+  // ── LCD action buttons ────────────────────────────────────────────────────
+  lcdExportBtn: {
+    marginTop: 10,
+    backgroundColor: '#3a2060',
+    paddingVertical: 8,
+    paddingHorizontal: 20,
+    borderRadius: 6,
+  },
+  lcdExportBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+
+  // Arrow-key confirmation box (replaces old "ERASE MEMORY" button)
+  eraseConfirmBox: {
+    marginVertical: 14,
+    borderWidth: 2.5,
+    borderColor: '#6a3a00',
+    borderRadius: 6,
+    paddingVertical: 10,
+    paddingHorizontal: 28,
+    backgroundColor: '#a8ae00',   // slightly darker than LCD to make it readable
     alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 18,
   },
-  overlayLine1: {
-    fontSize: 48,
-    fontWeight: '900',
-    color: '#f59e0b',       // amber — attention
-    letterSpacing: 3,
-    fontFamily: 'monospace',
-  },
-  overlayLine2: {
-    fontSize: 32,
-    fontWeight: '700',
-    color: '#fbbf24',
-    letterSpacing: 2,
-    fontFamily: 'monospace',
-    marginBottom: 8,
-  },
-  overlayOK: {
-    fontSize: 64,
-    fontWeight: '900',
-    color: '#22c55e',       // bright green
-    letterSpacing: 6,
-    fontFamily: 'monospace',
-    textShadowColor: '#22c55e66',
-    textShadowRadius: 12,
-    textShadowOffset: { width: 0, height: 0 },
-    marginBottom: 4,
-  },
-  overlaySub: {
-    fontSize: 22,
-    color: '#7ab8e8',
-    fontStyle: 'italic',
-    marginTop: 6,
-  },
-  bootIdentity: {
-    fontSize: 42,
-    fontWeight: '900',
-    color: '#f8fafc',
-    letterSpacing: 2,
-    textAlign: 'center',
-    fontFamily: MONO,
-    textShadowColor: '#60a5fa66',
-    textShadowRadius: 10,
-    textShadowOffset: { width: 0, height: 0 },
-  },
-  memoryValue: {
+  eraseConfirmArrow: {
     fontSize: 36,
     fontWeight: '900',
-    color: '#e2eaf8',
+    color: '#1a1a00',
     fontFamily: MONO,
-    letterSpacing: 2,
-    marginVertical: 10,
-    textAlign: 'center',
+    letterSpacing: 18,
+  },
+  eraseConfirmLabel: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#3a2000',
+    fontFamily: MONO,
+    letterSpacing: 1.5,
+    marginTop: 4,
   },
 
-  // ── Label selector (LABEL_ASSIGN screen) ───────────────────────────────────
-  labelSelectRow: {
-    flexDirection: 'row',
-    gap: 12,
-    marginVertical: 12,
-  },
-  labelOption: {
-    width: 80,
-    height: 80,
-    borderRadius: 8,
-    borderWidth: 3,
-    borderColor: '#1e4d8c',
-    backgroundColor: '#0a1628',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  labelOptionActive: {
-    borderColor: '#a78bfa',
-    backgroundColor: '#2d1f5e',
-    shadowColor: '#a78bfa',
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.6,
-    shadowRadius: 8,
-    elevation: 6,
-  },
-  labelOptionText: {
-    fontSize: 28,
-    fontWeight: '900',
-    color: '#5a7abf',
-    fontFamily: 'monospace',
-    letterSpacing: 1,
-  },
-  labelOptionTextActive: {
-    color: '#a78bfa',
-  },
-  labelDesc: {
-    fontSize: 22,
-    color: '#c084fc',
-    fontStyle: 'italic',
-    letterSpacing: 0.5,
-    marginBottom: 4,
-  },
-  iterValueSmall: {
-    fontSize: 32,
-    fontWeight: '900',
-    color: '#cbd5e1',
-    fontFamily: MONO,
-    letterSpacing: 1,
-  },
-  iterValueActive: {
-    color: '#60a5fa',
-    textShadowColor: '#60a5fa66',
-    textShadowRadius: 8,
-    textShadowOffset: { width: 0, height: 0 },
-  },
 
-  // ── Recall Table & Erase Button ─────────────────────────────────────────
-  eraseBtn: {
-    backgroundColor: '#991b1b',
-    borderWidth: 2,
-    borderColor: '#ef4444',
-    borderRadius: 6,
-    paddingVertical: 12,
-    paddingHorizontal: 24,
-    marginVertical: 16,
-    elevation: 4,
-  },
-  eraseBtnText: {
-    color: '#fef2f2',
-    fontSize: 26,
-    fontWeight: '900',
-    letterSpacing: 2,
-    fontFamily: MONO,
-  },
-  iterTableContainer: {
+  // ── Recall table ──────────────────────────────────────────────────────────
+  iterTable: {
     width: 280,
-    marginTop: 10,
-    marginBottom: 10,
-    backgroundColor: '#050d1a',
+    marginTop: 8,
+    backgroundColor: '#a0b000',
+    borderWidth: 1,
+    borderColor: LCD_OUTER,
   },
-  iterTableHeader: {
+  iterTableHead: {
     flexDirection: 'row',
-    backgroundColor: '#1e3a6a',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
+    backgroundColor: '#6a7800',
+    paddingVertical: 5,
+    paddingHorizontal: 10,
   },
-  iterTableColHeader: {
+  iterTableHdr: {
     flex: 1,
-    fontSize: 18,
+    fontSize: 14,
     fontWeight: '700',
-    color: '#9cc6ea',
+    color: '#e8f000',
     textAlign: 'center',
     fontFamily: MONO,
   },
   iterTableRow: {
     flexDirection: 'row',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#8a9a00',
   },
-  iterTableCol1: {
+  iterTableCell: {
     flex: 1,
-    fontSize: 20,
-    color: '#7ab8e8',
+    fontSize: 16,
+    color: LCD_TEXT,
     textAlign: 'center',
     fontFamily: MONO,
   },
-  iterTableCol2: {
-    flex: 1,
-    fontSize: 20,
-    color: '#e2eaf8',
+
+  // ── Info row tags ──────────────────────────────────────────────────────────
+  infoRow: {
+    flexDirection: 'row',
+    alignSelf: 'center',
+    gap: 8,
+    marginBottom: 6,
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+  },
+  infoChip: {
+    backgroundColor: '#7ea4ba',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 4,
+    color: '#0d1a33',
+    fontFamily: MONO,
+    fontSize: 9,
     fontWeight: '700',
-    textAlign: 'center',
-    fontFamily: MONO,
-    letterSpacing: 2,
+    letterSpacing: 0.5,
+    borderWidth: 1,
+    borderColor: '#60869a',
   },
-  recallHeaderRow: {
+  infoChipRun: {
+    backgroundColor: '#fdba74',
+    borderColor: '#fb923c',
+    color: '#7c2d12',
+  },
+  infoChipProg: {
+    backgroundColor: '#60a5fa',
+    borderColor: '#3b82f6',
+    color: '#fff',
+  },
+
+  // ── BLE Connection Indicator (Flavored pill) ──────────────────────────────
+  bleRegionOuter: {
+    alignSelf: 'center',
+    marginBottom: 12,
+  },
+  bleRegion: {
+    backgroundColor: '#1a2430',      // dark instrument-chassis recess
+    paddingHorizontal: 22,
+    paddingVertical: 7,
+    borderRadius: 20,               // pill shape
+    borderWidth: 1.5,
+    borderColor: '#2d3f50',
+    alignItems: 'center',
+    minWidth: 200,
+    shadowColor: '#000',
+    shadowOpacity: 0.5,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  bleRegionConnected: {
+    backgroundColor: '#1b7a2f',      // solid green when connected
+    borderColor: '#11561f',
+    shadowColor: '#4ade80',
+    shadowRadius: 10,
+    shadowOpacity: 0.9,
+    elevation: 6,
+  },
+  bleRegionTouch: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  bleRegionText: {
+    fontFamily: MONO,
+    fontSize: 13,
+    fontWeight: '700',
+    letterSpacing: 1.5,
+    color: '#4a6a5a',               // muted green when idle/not connected
+    textAlign: 'center',
+  },
+  bleRegionTextAction: {
+    fontFamily: MONO,
+    fontSize: 13,
+    fontWeight: '900',
+    letterSpacing: 1.5,
+    color: '#c8f7d0',               // pale green when ready to scan
+    textAlign: 'center',
+  },
+  bleRegionTextHighlight: {
+    fontFamily: MONO,
+    fontSize: 13,
+    fontWeight: '900',
+    letterSpacing: 2,
+    color: '#4ade80',               // bright neon green when actively scanning
+    textAlign: 'center',
+  },
+
+  // ── BLE Device list rows (inside LCD) ─────────────────────────────────────
+  bleDeviceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#9aab00',
+  },
+  bleConnectBtn: {
+    backgroundColor: '#15223a',
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 5,
+    borderWidth: 1.5,
+    borderColor: '#dce8ff',
+    marginLeft: 10,
+    shadowColor: '#000',
+    shadowOpacity: 0.5,
+    shadowRadius: 2,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 3,
+  },
+  bleConnectBtnText: {
+    color: '#dce8ff',
+    fontFamily: MONO,
+    fontSize: 13,
+    fontWeight: '900',
+    letterSpacing: 1,
+  },
+
+  // ── Button Panel Wrapper (matches dark teal plate from physical panel) ───
+  buttonPanelWrapper: {
+    alignSelf: 'center',
+    backgroundColor: BTN_PANEL,
+    borderRadius: 4,
+    borderWidth: 4,
+    borderColor: '#181e26',
+    padding: 16,
+    marginBottom: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.4,
+    shadowRadius: 6,
+    elevation: 6,
+  },
+
+  buttonGrid: {
+    gap: 16,
+  },
+
+  buttonRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 16,
+  },
+
+  // Big square buttons
+  btn: {
+    width: 90,
+    height: 90,
+    backgroundColor: BTN_BG,
+    borderWidth: 2,
+    borderColor: BTN_BORDER,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 2,
+    elevation: 4,
+  },
+
+  btnText: {
+    fontSize: 20,
+    fontWeight: '900',
+    color: BTN_TEXT,
+    letterSpacing: 1,
+  },
+
+  arrowChar: {
+    fontSize: 50,
+    color: BTN_TEXT,
+    fontWeight: '900',
+    marginTop: -8,
+  },
+
+  btnProgActive: {
+    backgroundColor: '#1a2a5a',
+    borderColor: PROG_COLOR,
+  },
+  btnTextProg: { color: PROG_COLOR },
+
+  // ── HV Setting Panel ──────────────────────────────────────────────────────
+  hvPanel: {
+    width: '100%',
+    backgroundColor: '#507090',   // matches the device body area
+    borderWidth: 1.5,
+    borderColor: '#3a5570',
+    borderRadius: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    marginBottom: 8,
+    alignItems: 'center',
+  },
+  hvTitle: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#dce8ff',
+    letterSpacing: 2.5,
+    marginBottom: 6,
+  },
+  hvRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    marginBottom: 6,
+  },
+  hvBtn: {
+    width: 74,
+    height: 52,
+    backgroundColor: BTN_BG,
+    borderWidth: 2,
+    borderColor: BTN_BORDER,
+    borderRadius: 5,
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 3,
+  },
+  hvBtnDisabled: { opacity: 0.35 },
+  hvBtnArrow: { fontSize: 22, color: BTN_TEXT, fontWeight: '900' },
+  hvBtnStep:  { fontSize: 10, color: '#7ab8e8', fontWeight: '700', marginTop: 2 },
+
+  hvDisplay: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
+    backgroundColor: LCD_BG,
+    borderWidth: 3,
+    borderColor: LCD_OUTER,
+    borderRadius: 3,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    gap: 4,
+    shadowColor: '#c8d400',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.4,
+    shadowRadius: 6,
+    elevation: 4,
+  },
+  hvDisplayLabel: { fontSize: 14, color: LCD_LABEL, fontFamily: MONO, fontWeight: '700' },
+  hvDisplayValue: {
+    fontSize: 30,
+    fontWeight: '900',
+    color: LCD_TEXT,
+    fontFamily: MONO,
+    letterSpacing: 3,
+  },
+  hvDisplayUnit: { fontSize: 16, color: LCD_LABEL, fontFamily: MONO },
+
+  hvStepRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  hvStepLabel: { fontSize: 11, color: '#dce8ff', fontWeight: '700', letterSpacing: 0.5 },
+  hvStepBtn: {
+    paddingVertical: 4,
+    paddingHorizontal: 14,
+    borderWidth: 1.5,
+    borderColor: '#3a5570',
+    borderRadius: 4,
+    backgroundColor: BTN_BG,
+  },
+  hvStepBtnActive:   { backgroundColor: '#1a3a6a', borderColor: PROG_COLOR },
+  hvStepTxt:         { fontSize: 13, fontWeight: '700', color: '#7ab8e8' },
+  hvStepTxtActive:   { color: PROG_COLOR },
+
+  // ── Bottom bar ────────────────────────────────────────────────────────────
+  bottomBar: {
+    width: '100%',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 4,
+  },
+  brandText: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: LABEL_TEXT,
+    letterSpacing: 1,
+    fontFamily: MONO,
+  },
+  hintText: {
+    flex: 1,
+    fontSize: 13,
+    color: HINT_TEXT,
+    fontStyle: 'italic',
+    textAlign: 'center',
+    letterSpacing: 0.3,
+    marginHorizontal: 8,
+  },
+  modelText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: LABEL_TEXT,
+    fontFamily: MONO,
+    letterSpacing: 0.5,
   },
 });
-

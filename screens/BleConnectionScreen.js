@@ -163,7 +163,7 @@ export default function BleConnectionScreen() {
       {showPicker && (
         <View style={styles.pickerContainer}>
           <Text style={styles.pickerTitle}>
-            NEARBY DEVICES  ·  {ble.foundDevices.length} found  ·  tap to connect
+            NEARBY DEVICES  ·  {ble.foundDevices.length} found  ·  press CONNECT
           </Text>
           <ScrollView
             style={styles.pickerScroll}
@@ -175,26 +175,36 @@ export default function BleConnectionScreen() {
               .map((device) => {
                 const isDetector = device.name.toLowerCase().includes('52810');
                 return (
-                  <TouchableOpacity
+                  <View
                     key={device.id}
                     style={[styles.deviceRow, isDetector && styles.deviceRowHighlight]}
-                    onPress={() => ble.connectToDevice(device.id)}
-                    activeOpacity={0.75}
                   >
                     <View style={styles.deviceRowLeft}>
-                      <Text style={styles.deviceRowName}>{device.name}</Text>
-                      <Text style={styles.deviceRowId}>{device.id.slice(-11)}</Text>
-                    </View>
-                    <View style={styles.deviceRowRight}>
-                      <RssiBar rssi={device.rssi} />
-                      <Text style={styles.rssiLabel}>{device.rssi} dBm</Text>
-                    </View>
-                    {isDetector && (
-                      <View style={styles.detectorTag}>
-                        <Text style={styles.detectorTagText}>DETECTOR</Text>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                        <Text style={styles.deviceRowName}>{device.name}</Text>
+                        {isDetector && (
+                          <View style={styles.detectorTag}>
+                            <Text style={styles.detectorTagText}>DETECTOR</Text>
+                          </View>
+                        )}
                       </View>
-                    )}
-                  </TouchableOpacity>
+                      <Text style={styles.deviceRowId}>{device.id.slice(-11)}</Text>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 2 }}>
+                        <RssiBar rssi={device.rssi} />
+                        <Text style={styles.rssiLabel}>{device.rssi} dBm</Text>
+                      </View>
+                    </View>
+                    {/* Explicit CONNECT button */}
+                    <TouchableOpacity
+                      style={[styles.connectBtn, isDetector && styles.connectBtnPrimary]}
+                      onPress={() => ble.connectToDevice(device.id)}
+                      activeOpacity={0.8}
+                    >
+                      <Text style={[styles.connectBtnText, isDetector && styles.connectBtnTextPrimary]}>
+                        CONNECT
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
                 );
               })}
           </ScrollView>
@@ -359,6 +369,33 @@ const styles = StyleSheet.create({
   scanBtnText: { color: '#fff', fontSize: 13, fontWeight: '700', letterSpacing: 1.5 },
   skipBtn: { paddingVertical: 8 },
   skipBtnText: { color: '#374151', fontSize: 10, letterSpacing: 1, textDecorationLine: 'underline' },
+
+  // Explicit connect button (on each device row)
+  connectBtn: {
+    backgroundColor: '#1e3a6a',
+    borderWidth: 1.5,
+    borderColor: '#3b82f6',
+    borderRadius: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 80,
+  },
+  connectBtnPrimary: {
+    backgroundColor: '#064e3b',
+    borderColor: '#34d399',
+  },
+  connectBtnText: {
+    color: '#60a5fa',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 1.2,
+  },
+  connectBtnTextPrimary: {
+    color: '#34d399',
+  },
+
 
   hint: {
     color: '#1f2937', fontSize: 10, textAlign: 'center',
