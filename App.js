@@ -20,6 +20,7 @@ import React, {
 import {
   View,
   Text,
+  Image,
   TouchableOpacity,
   StyleSheet,
   Alert,
@@ -467,6 +468,14 @@ function GMCountingScreen() {
     }
     if (progSub === PROG_ITERATION_ADJUST) { setProgSub(PROG_SET_HV); return; }
     if (progSub === PROG_SET_HV)           {
+      // ── Send HV command to scintillator device ──────────────────────────
+      if (ble.isConnected) {
+        const cmd = `STHV ${hv}`;
+        ble.sendCommand(cmd).then((ok) => {
+          if (ok) showFlashMessage(`HV SET: ${hv}V`);
+          else    showFlashMessage('HV CMD FAILED');
+        });
+      }
       if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') setProgSub(PROG_DATA_STORE);
       else { setProgSub(PROG_DHV_ADJUST); setActiveParamField(PARAM_FIELD_DHV); }
       return;
@@ -548,6 +557,8 @@ function GMCountingScreen() {
 
   // ── STORE ────────────────────────────────────────────────────────────────
   const handleSTORE = () => {
+    // During SET_HV: STORE toggles the step size between 30V and 50V
+    if (progSub === PROG_SET_HV) { setHvStep((s) => s === 30 ? 50 : 30); return; }
     if (bootStage !== BOOT_READY || isRunning || progSub !== PROG_OFF || flashMessage) return;
     if (storeDataMode === STORE_MODE_MANUAL) {
       if (!pendingMeasurement) { showFlashMessage('NO DATA TO STORE'); return; }
@@ -666,7 +677,7 @@ function GMCountingScreen() {
     : progSub === PROG_DATA_OUTPUT     ? '▲ → EXPORT  ·  ▼ → Change route  ·  PROG → Skip'
     : progSub === PROG_DATA_RECALL     ? '▲ / ▼ → Scroll records  ·  PROG → Next'
     : progSub === PROG_DATA_ERASE      ? '▲ or ▼ → CONFIRM ERASE  ·  PROG → Cancel erase'
-    : progSub === PROG_SET_HV          ? `▲ +${hvStep}V  ·  ▼ -${hvStep}V  ·  PROG → Next`
+    : progSub === PROG_SET_HV          ? `▲ +${hvStep}V  ·  ▼ -${hvStep}V  ·  STORE ⇄ ${hvStep === 30 ? 50 : 30}V step  ·  PROG → Next`
     : storeDataMode === STORE_MODE_MANUAL
       ? 'STORE → save pending  ·  PROG → programming mode'
       : 'PROG → enter programming mode';
@@ -694,7 +705,14 @@ function GMCountingScreen() {
         <View style={styles.bleRegionOuter}>
           <View style={[styles.bleRegion, ble.isConnected && styles.bleRegionConnected]}>
             {ble.isConnected ? (
-              <Text style={[styles.bleRegionText, { color: '#fff', letterSpacing: 2 }]}>◉  CONNECTED</Text>
+              <View style={{ alignItems: 'center' }}>
+                <Text style={[styles.bleRegionText, { color: '#fff', letterSpacing: 2 }]}>◉  CONNECTED</Text>
+                {ble.connectedDevice?.name || ble.connectedDevice?.localName ? (
+                  <Text style={{ fontFamily: MONO, fontSize: 10, color: '#c8ffd0', letterSpacing: 1, marginTop: 2 }}>
+                    {ble.connectedDevice.name ?? ble.connectedDevice.localName}
+                  </Text>
+                ) : null}
+              </View>
             ) : isBleMenuOpen ? (
               <TouchableOpacity onPress={() => ble.startScan()} activeOpacity={0.7} style={styles.bleRegionTouch}>
                 <Text style={ble.isScanning ? styles.bleRegionTextHighlight : styles.bleRegionTextAction}>
@@ -731,26 +749,45 @@ function GMCountingScreen() {
 
             {/* ══ BLE DEVICE LIST (inside LCD) ══ */}
             {!isBooting && flashMessage === '' && isBleMenuOpen && !ble.isConnected && (
-              <View style={[styles.lcdOverlay, { paddingHorizontal: 14, paddingVertical: 8, backgroundColor: '#c8ce1a' }]}>
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between', borderBottomWidth: 2, borderBottomColor: '#8a9000', paddingBottom: 6, marginBottom: 8 }}>
-                  <Text style={{ fontFamily: MONO, fontWeight: '900', fontSize: 15, color: '#2a2e00', letterSpacing: 2 }}>◆ BLE DEVICES</Text>
+              <View style={[styles.lcdOverlay, { paddingHorizontal: 14, paddingVertical: 8, backgroundColor: '#c8ce1a', alignItems: 'stretch' }]}>
+                {/* Header */}
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', borderBottomWidth: 2, borderBottomColor: '#8a9000', paddingBottom: 5, marginBottom: 6 }}>
+                  <Text style={{ fontFamily: MONO, fontWeight: '900', fontSize: 14, color: '#2a2e00', letterSpacing: 2 }}>
+                    ◆ BLE DEVICES ({ble.foundDevices.length})
+                  </Text>
                   <TouchableOpacity onPress={() => setIsBleMenuOpen(false)} hitSlop={{top:8,bottom:8,left:8,right:8}}>
-                    <Text style={{ fontFamily: MONO, fontWeight: '900', fontSize: 13, color: '#6a0000', letterSpacing: 1 }}>[ESC]</Text>
+                    <Text style={{ fontFamily: MONO, fontWeight: '900', fontSize: 12, color: '#6a0000', letterSpacing: 1 }}>[ESC]</Text>
                   </TouchableOpacity>
                 </View>
+
                 {ble.foundDevices.length === 0 ? (
-                  <Text style={{ fontFamily: MONO, fontSize: 14, color: '#2a2e00', textAlign: 'center', marginTop: 18, opacity: 0.75, letterSpacing: 1 }}>
-                    {ble.isScanning ? 'Scanning for devices...' : 'No devices found.\nTap START SCAN.'}
+                  <Text style={{ fontFamily: MONO, fontSize: 14, color: '#2a2e00', textAlign: 'center', marginTop: 14, opacity: 0.75, letterSpacing: 1 }}>
+                    {ble.isScanning ? 'Scanning...' : 'No devices found.\nTap START SCAN.'}
                   </Text>
                 ) : (
                   <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false}>
                     {ble.foundDevices.map((d, i) => (
                       <View key={d.id} style={styles.bleDeviceRow}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={{ fontFamily: MONO, fontWeight: '900', fontSize: 14, color: '#1a1e00' }} numberOfLines={1}>{i + 1}.  {d.name || 'Unknown'}</Text>
-                          <Text style={{ fontFamily: MONO, fontSize: 11, color: '#4a5000', letterSpacing: 0.5 }} numberOfLines={1}>{d.id || ''}</Text>
+                        {/* Name + Address */}
+                        <View style={{ flex: 1, marginRight: 8 }}>
+                          <Text
+                            style={{ fontFamily: MONO, fontWeight: '900', fontSize: 15, color: '#0a0d00', letterSpacing: 0.5 }}
+                            numberOfLines={1}
+                          >
+                            {i + 1}. {d.name || 'Unknown'}
+                          </Text>
+                          <Text
+                            style={{ fontFamily: MONO, fontSize: 11, color: '#3a4000', letterSpacing: 0.3, marginTop: 1 }}
+                            numberOfLines={1}
+                          >
+                            {d.id || 'No address'}
+                          </Text>
                         </View>
-                        <TouchableOpacity style={styles.bleConnectBtn} onPress={() => { ble.connectToDevice(d.id); setIsBleMenuOpen(false); }}>
+                        {/* Connect button */}
+                        <TouchableOpacity
+                          style={styles.bleConnectBtn}
+                          onPress={() => { ble.connectToDevice(d.id); setIsBleMenuOpen(false); }}
+                        >
                           <Text style={styles.bleConnectBtnText}>CONNECT</Text>
                         </TouchableOpacity>
                       </View>
@@ -825,12 +862,16 @@ function GMCountingScreen() {
             {/* ══ SET_HV ══ */}
             {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_SET_HV && (
               <View style={styles.lcdOverlay}>
+                {/* Line 1: label | step indicator */}
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>SET HV</Text>
-                  <Text style={styles.lcdPhysRight}>HV</Text>
+                  <Text style={[styles.lcdPhysRight, { fontSize: 18, color: '#3a4a00', letterSpacing: 1 }]}>
+                    STEP {hvStep}V
+                  </Text>
                 </View>
+                {/* Line 2: HV value (large) */}
                 <View style={styles.lcdPhysRow}>
-                  <Text style={styles.lcdPhysLeft}>{''}</Text>
+                  <Text style={styles.lcdPhysLeft}>HV</Text>
                   <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
                 </View>
               </View>
@@ -1018,7 +1059,11 @@ function GMCountingScreen() {
 
         {/* ── Bottom bar ────────────────────────────────────────────────── */}
         <View style={styles.bottomBar}>
-          <Text style={styles.brandText}>NUCLEONIX 🅽</Text>
+          <Image
+            source={require('./image.jpeg')}
+            style={styles.brandLogo}
+            resizeMode="contain"
+          />
           <Text style={styles.hintText}>{progLabel}</Text>
           <Text style={styles.modelText}>GC 602A</Text>
         </View>
@@ -1611,6 +1656,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: 4,
+  },
+  brandLogo: {
+    width: 48,
+    height: 48,
+    borderRadius: 6,
   },
   brandText: {
     fontSize: 13,

@@ -18,7 +18,7 @@
 import { useEffect, useRef, useCallback, useReducer } from 'react';
 import { Platform, PermissionsAndroid, Alert } from 'react-native';
 import { BleManager, State as BleState } from 'react-native-ble-plx';
-import { decode as decodeBase64 } from 'base-64';
+import { decode as decodeBase64, encode as encodeBase64 } from 'base-64';
 
 // ── UUIDs ──────────────────────────────────────────────────────────
 export const UART_SERVICE_UUID = '6E400001-B5A3-F393-E0A9-E50E24DCCA9E';
@@ -152,11 +152,14 @@ async function requestAndroidPermissions() {
 export function useBleDetector({ onCountReceived } = {}) {
   const [state, dispatch] = useReducer(reducer, initialState);
 
-  const managerRef     = useRef(null);
-  const scanTimerRef   = useRef(null);
-  const monitorSubRef  = useRef(null);
-  const isScanningRef  = useRef(false);    // avoids stale closure in timeout
-  const isConnectingRef = useRef(false);   // prevents double-connect
+  const managerRef       = useRef(null);
+  const scanTimerRef     = useRef(null);
+  const monitorSubRef    = useRef(null);
+  const isScanningRef    = useRef(false);    // avoids stale closure in timeout
+  const isConnectingRef  = useRef(false);   // prevents double-connect
+  // Writable char UUIDs discovered during service enumeration (used by sendCommand)
+  const writeSvcUUIDRef  = useRef(UART_SERVICE_UUID);
+  const writeCharUUIDRef = useRef(UART_TX_CHAR_UUID);
 
   // ── Count queue ────────────────────────────────────────────────
   // BLE sends batches of CPS readings. The queue drains them one
@@ -258,11 +261,17 @@ export function useBleDetector({ onCountReceived } = {}) {
             ` | write=${ch.isWritableWithResponse}`
           );
           // Prefer a characteristic that is notifiable but NOT writable —
-          // that's the TX channel (data FROM device). Skip RX (write+notify).
+          // that's the RX channel (data FROM device). Skip TX (write+notify).
           const isPureNotify = (ch.isNotifiable || ch.isIndicatable) && !ch.isWritableWithResponse;
           if (!notifyCharUUID && isPureNotify) {
             notifySvcUUID  = svc.uuid;
             notifyCharUUID = ch.uuid;
+          }
+          // Track writable characteristic (TX — phone → device)
+          if (ch.isWritableWithResponse || ch.isWritableWithoutResponse) {
+            writeSvcUUIDRef.current  = svc.uuid;
+            writeCharUUIDRef.current = ch.uuid;
+            console.log('[BLE] Write char discovered:', ch.uuid);
           }
         }
       }
@@ -475,6 +484,32 @@ export function useBleDetector({ onCountReceived } = {}) {
     dispatch({ type: 'RESET' });
   }, [disconnect]);
 
+  /**
+   * Send a plain-text command string to the connected scintillator device.
+   * The string is Base64-encoded and written to the writable UART TX characteristic.
+   * Example: sendCommand('STHV 400')
+   */
+  const sendCommand = useCallback(async (text) => {
+    const device = state.connectedDevice;
+    if (!device) {
+      console.warn('[BLE] sendCommand: no connected device');
+      return false;
+    }
+    try {
+      const encoded = encodeBase64(text);
+      await device.writeCharacteristicWithResponseForService(
+        writeSvcUUIDRef.current,
+        writeCharUUIDRef.current,
+        encoded,
+      );
+      console.log('[BLE] Command sent:', text);
+      return true;
+    } catch (e) {
+      console.error('[BLE] sendCommand failed:', e.message, '| code:', e.errorCode);
+      return false;
+    }
+  }, [state.connectedDevice]);
+
   return {
     bleAdapterState: state.bleAdapterState,
     status:          state.status,
@@ -490,5 +525,6 @@ export function useBleDetector({ onCountReceived } = {}) {
     connectToDevice,  // ← manual connect by ID
     disconnect,
     reset,
+    sendCommand,      // ← write a text command to the device
   };
 }
