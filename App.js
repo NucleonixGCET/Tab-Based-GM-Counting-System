@@ -1113,7 +1113,7 @@ function GMCountingScreen() {
             style={styles.brandLogo}
             resizeMode="contain"
           />
-          <Text style={styles.hintText}></Text>
+          <Text style={styles.hintText}>NUCLEONIX</Text>
           <Text style={styles.modelText}>GC 602A</Text>
         </View>
 
@@ -1710,11 +1710,12 @@ const styles = StyleSheet.create({
   },
   hintText: {
     flex: 1,
-    fontSize: 13,
-    color: HINT_TEXT,
-    fontStyle: 'italic',
-    textAlign: 'center',
-    letterSpacing: 0.3,
+    fontSize: 20,
+    color: LABEL_TEXT,
+    textAlign: 'left',
+    fontFamily: MONO,
+    fontWeight: '700',
+    letterSpacing: 0.5,
     marginHorizontal: 8,
   },
   modelText: {
