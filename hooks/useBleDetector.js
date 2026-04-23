@@ -450,18 +450,40 @@ export function useBleDetector({ onCountReceived } = {}) {
   const connectToDevice = useCallback(async (deviceId) => {
     const manager = managerRef.current;
     if (!manager) return;
+    if (isConnectingRef.current) return;   // prevent double-tap
+    isConnectingRef.current = true;
+
+    // 1. Stop scan — an active scan conflicts with connection on Android
+    _stopScan();
+    dispatch({ type: 'STATUS', payload: BLE_STATUS.CONNECTING });
+
+    // 2. Cancel any lingering native connection for this device ID
     try {
-      // react-native-ble-plx can connect by ID directly
+      await manager.cancelDeviceConnection(deviceId);
+      console.log('[BLE] Cleared stale connection for', deviceId);
+    } catch (_) {
+      // No existing connection — fine, continue.
+    }
+
+    // 3. Short settle delay so Android BLE stack is ready
+    await new Promise(resolve => setTimeout(resolve, 300));
+
+    try {
       const device = await manager.connectToDevice(deviceId, {
         timeout: 10_000,
         autoConnect: false,
       });
-      dispatch({ type: 'CONNECTED', payload: device });
       console.log('[BLE] Manually connected to:', device.id);
+      dispatch({ type: 'CONNECTED', payload: device });
+
+      // 4. Stabilise before GATT operations (same as auto-connect path)
+      await new Promise(resolve => setTimeout(resolve, 400));
+
       await _startMonitor(device);
     } catch (e) {
-      console.error('[BLE] Manual connect failed:', e.message);
+      console.error('[BLE] Manual connect failed:', e.message, '| code:', e.errorCode);
       dispatch({ type: 'ERROR', payload: `Connection failed (code ${e.errorCode ?? '?'})` });
+      isConnectingRef.current = false;
     }
   }, []);
 
