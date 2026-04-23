@@ -2,7 +2,7 @@
 
 A professional, tablet-optimized radiation monitoring application designed for Nucleonix Scintillation Detectors. This system interfaces with Nordic nRF52810-based hardware via Bluetooth Low Energy (BLE) to provide real-time data acquisition, visualization, and persistent storage.
 
-![App Interface Mockup](image.jpeg)
+![App Interface Mockup](NSPL-p.jpg.jpeg)
 
 ## 🌟 Key Features
 
