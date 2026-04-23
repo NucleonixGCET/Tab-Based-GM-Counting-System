@@ -1,4 +1,4 @@
-/**
+﻿/**
  * GM Counting System — App.js
  * Visual design matches the NUCLEONIX GC-602A physical instrument.
  *
@@ -198,6 +198,7 @@ function GMCountingScreen() {
   const intervalRef        = useRef(null);
   const windowCountsRef    = useRef(0);
   const windowElapsedRef   = useRef(0);
+  const cpmHistoryRef      = useRef([]);
   const displayedCountsRef = useRef(0);
   const elapsedTimeRef     = useRef(0);
   const bleIsConnectedRef  = useRef(false);
@@ -450,30 +451,19 @@ function GMCountingScreen() {
       } else if (acqMode === 'CPM') {
         elapsedTimeRef.current += 1;
         setElapsedTime((t) => t + 1);
-        if (bleIsConnectedRef.current) {
-          // BLE path: accumulate raw CPS readings (bleCpsRef) — NOT displayedCountsRef
-          // which could already hold the last CPM result and would corrupt the window.
-          windowCountsRef.current += bleCpsRef.current;
-          windowElapsedRef.current += 1;
-          if (windowElapsedRef.current >= 5) {
-            const cpm = windowCountsRef.current * 12;
+        
+        const currentCps = bleIsConnectedRef.current ? bleCpsRef.current : tick;
+        cpmHistoryRef.current.push(currentCps);
+        
+        // 5 second sliding window, updating every 2 seconds
+        if (cpmHistoryRef.current.length >= 5) {
+          if ((cpmHistoryRef.current.length - 5) % 2 === 0) {
+            const last5 = cpmHistoryRef.current.slice(-5);
+            const sum = last5.reduce((a, b) => a + b, 0);
+            const cpm = sum * 12;
             displayedCountsRef.current = cpm;
             setDisplayedCounts(cpm);
             iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpm, refHv: refHvRef.current });
-            windowCountsRef.current = 0;
-            windowElapsedRef.current = 0;
-          }
-        } else {
-          // Simulated path: add random CPS tick each second
-          windowCountsRef.current += tick;
-          windowElapsedRef.current += 1;
-          if (windowElapsedRef.current >= 5) {
-            const cpm = windowCountsRef.current * 12;
-            displayedCountsRef.current = cpm;
-            setDisplayedCounts(cpm);
-            iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpm, refHv: refHvRef.current });
-            windowCountsRef.current = 0;
-            windowElapsedRef.current = 0;
           }
         }
       }
@@ -599,7 +589,7 @@ function GMCountingScreen() {
     }
     setCounts(0); displayedCountsRef.current = 0; setDisplayedCounts(0);
     elapsedTimeRef.current = 0; setElapsedTime(0); setRunningTotal(0);
-    windowCountsRef.current = 0; windowElapsedRef.current = 0;
+    windowCountsRef.current = 0; windowElapsedRef.current = 0; cpmHistoryRef.current = [];
     iterationResultsRef.current = [];
     setCurrentIteration(iterations > 1 ? 1 : 0);
     programSessionRef.current = null;
@@ -1119,7 +1109,7 @@ function GMCountingScreen() {
         {/* ── Bottom bar ────────────────────────────────────────────────── */}
         <View style={styles.bottomBar}>
           <Image
-            source={require('./image.jpeg')}
+            source={require('./NSPL-LOGO.jpg.jpeg')}
             style={styles.brandLogo}
             resizeMode="contain"
           />
