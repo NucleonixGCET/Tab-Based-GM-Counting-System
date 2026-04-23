@@ -556,7 +556,7 @@ function GMCountingScreen() {
       return;
     }
     if (progSub === PROG_DATA_ERASE)  { handleEraseData(); return; }
-    if (progSub === PROG_SET_HV)      { setDraftHvDigits((p) => { const n = [...p]; n[hvCursorPos] = (n[hvCursorPos] + 1) % 10; return n; }); return; }
+    if (progSub === PROG_SET_HV)      { setDraftHvDigits((p) => { const n = [...p]; n[hvCursorPos] = hvCursorPos === 0 ? (n[hvCursorPos] + 1) % 2 : (n[hvCursorPos] + 1) % 10; return n; }); return; }
     if (progSub === PROG_ACQ_SELECT)       { setDraftAcqMode((m) => ACQ_MODE_ORDER[(ACQ_MODE_ORDER.indexOf(m) + 1) % ACQ_MODE_ORDER.length]); }
     else if (progSub === PROG_TIME_ADJUST) { setDraftDigits((p) => { const n = [...p]; n[cursorPos] = (n[cursorPos] + 1) % 10; return n; }); }
     else if (progSub === PROG_ITERATION_ADJUST) { setDraftIterations((n) => Math.min(n + 1, 20)); }
