@@ -764,40 +764,24 @@ function GMCountingScreen() {
         {/* ── Title ─────────────────────────────────────────────────────── */}
         <Text style={styles.deviceTitle}>G.M COUNTING SYSTEM (AT)</Text>
 
-        {/* ── Small info row ────────────────────────────────────────────── */}
-        <View style={styles.infoRow}>
-          <Text style={styles.infoChip}>MEM {String(memoryCount).padStart(4, '0')}</Text>
-          <Text style={styles.infoChip}>STORE {storeDataMode}</Text>
-          <Text style={styles.infoChip}>ACQ {ACQ_LABELS[acqMode]}</Text>
-          {isRunning && <Text style={[styles.infoChip, styles.infoChipRun]}>● RUNNING</Text>}
-          {isProgOn  && <Text style={[styles.infoChip, styles.infoChipProg]}>PROG {progSubIcon}</Text>}
-        </View>
-
         {/* ── BLE Status Indicator (Premium pill) ───────────────────────── */}
-        <View style={styles.bleRegionOuter}>
-          <View style={[styles.bleRegion, ble.isConnected && styles.bleRegionConnected]}>
-            {ble.isConnected ? (
-              <View style={{ alignItems: 'center' }}>
-                <Text style={[styles.bleRegionText, { color: '#fff', letterSpacing: 2 }]}>◉  CONNECTED</Text>
-                {ble.connectedDevice?.name || ble.connectedDevice?.localName ? (
-                  <Text style={{ fontFamily: MONO, fontSize: 10, color: '#c8ffd0', letterSpacing: 1, marginTop: 2 }}>
-                    {ble.connectedDevice.name ?? ble.connectedDevice.localName}
+        {!ble.isConnected && (
+          <View style={styles.bleRegionOuter}>
+            <View style={styles.bleRegion}>
+              {isBleMenuOpen ? (
+                <TouchableOpacity onPress={() => ble.startScan()} activeOpacity={0.7} style={styles.bleRegionTouch}>
+                  <Text style={ble.isScanning ? styles.bleRegionTextHighlight : styles.bleRegionTextAction}>
+                    {ble.isScanning ? '◉  SCANNING...' : '▶  START SCAN'}
                   </Text>
-                ) : null}
-              </View>
-            ) : isBleMenuOpen ? (
-              <TouchableOpacity onPress={() => ble.startScan()} activeOpacity={0.7} style={styles.bleRegionTouch}>
-                <Text style={ble.isScanning ? styles.bleRegionTextHighlight : styles.bleRegionTextAction}>
-                  {ble.isScanning ? '◉  SCANNING...' : '▶  START SCAN'}
-                </Text>
-              </TouchableOpacity>
-            ) : (
-              <TouchableOpacity onPress={() => setIsBleMenuOpen(true)} activeOpacity={0.7} style={styles.bleRegionTouch}>
-                <Text style={styles.bleRegionText}>◎  NOT CONNECTED</Text>
-              </TouchableOpacity>
-            )}
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity onPress={() => setIsBleMenuOpen(true)} activeOpacity={0.7} style={styles.bleRegionTouch}>
+                  <Text style={styles.bleRegionText}>◎  NOT CONNECTED</Text>
+                </TouchableOpacity>
+              )}
+            </View>
           </View>
-        </View>
+        )}
 
         {/* ── LCD Display ───────────────────────────────────────────────── */}
         <View style={styles.lcdOuter}>
@@ -1139,7 +1123,7 @@ function GMCountingScreen() {
             style={styles.brandLogo}
             resizeMode="contain"
           />
-          <Text style={styles.hintText}>{progLabel}</Text>
+          <Text style={styles.hintText}></Text>
           <Text style={styles.modelText}>GC 602A</Text>
         </View>
 
@@ -1195,7 +1179,7 @@ const styles = StyleSheet.create({
 
   // ── Title ─────────────────────────────────────────────────────────────────
   deviceTitle: {
-    fontSize: 26,
+    fontSize: 40,
     fontWeight: '700',
     color: LABEL_TEXT,
     letterSpacing: 3,
@@ -1744,7 +1728,7 @@ const styles = StyleSheet.create({
     marginHorizontal: 8,
   },
   modelText: {
-    fontSize: 13,
+    fontSize: 24,
     fontWeight: '700',
     color: LABEL_TEXT,
     fontFamily: MONO,
