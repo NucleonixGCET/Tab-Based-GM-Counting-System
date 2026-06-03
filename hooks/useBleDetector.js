@@ -54,6 +54,7 @@ const initialState = {
   status:          BLE_STATUS.IDLE,
   connectedDevice: null,
   liveCount:       null,
+  liveHV:          null,   // current HV in Volts (from CurHV field, kV → V)
   errorMessage:    null,
   isScanning:      false,
   foundDevices:    [],   // [{id, name, rssi}] — for manual picker
@@ -72,7 +73,7 @@ function reducer(state, action) {
     case 'MONITORING':
       return { ...state, status: BLE_STATUS.MONITORING };
     case 'LIVE_COUNT':
-      return { ...state, liveCount: action.payload };
+      return { ...state, liveCount: action.payload.count, liveHV: action.payload.hv ?? state.liveHV };
     case 'SCANNING':
       return {
         ...state,
@@ -107,26 +108,43 @@ function decodeCharacteristicValue(base64Value) {
 }
 
 /**
- * Parses one BLE frame from the nRF52810 detector.
+ * Parses one BLE frame from the ESP32 detector.
  *
- * Detector format (one or many per packet):
- *   "Cnts:35!\r\nCnts:39!\r\nCnts:40!\r\n"
+ * Firmware format (one or many per BLE notification):
+ *   "Counts,<n>,CurHV,<kV>!\r\n"
+ *   e.g. "Counts,12,CurHV,2.315!\r\n"
  *
  * Edge-cases handled:
- *   - Fragmented leading byte: "nts:35!" (BLE split the 'C' into the prev packet)
- *   - Multiple readings in one BLE notification (MTU batching)
+ *   - Multiple readings batched in a single BLE notification (MTU batching)
+ *   - Fragmented packets (partial frame at start/end of buffer)
  *
- * Returns an array of integers (may be empty if nothing matched).
+ * Returns an array of { count: number, hv: number|null } objects.
+ * hv is in Volts (converted from kV by multiplying by 1000).
  */
-function parseCountValues(rawText) {
+function parseFrame(rawText) {
   if (!rawText) return [];
-  // Match both "Cnts:35!" and the fragmented "nts:35!" variant
-  const matches = rawText.matchAll(/C?nts:(\d+)!/g);
-  const counts = [];
-  for (const m of matches) {
-    counts.push(parseInt(m[1], 10));
+  // Match "Counts,<integer>,CurHV,<float>!" — all parts optional for resilience
+  // Also handles legacy "Cnts:<n>!" format for backward compatibility
+  const results = [];
+
+  // Primary format: Counts,N,CurHV,F!
+  const newFmt = rawText.matchAll(/Counts,(\d+),CurHV,([\d.]+)!/g);
+  for (const m of newFmt) {
+    results.push({
+      count: parseInt(m[1], 10),
+      hv:    Math.round(parseFloat(m[2]) * 1000),  // kV → V
+    });
   }
-  return counts;
+
+  // If nothing matched above, fall back to legacy format "C?nts:<n>!"
+  if (results.length === 0) {
+    const legacyFmt = rawText.matchAll(/C?nts:(\d+)!/g);
+    for (const m of legacyFmt) {
+      results.push({ count: parseInt(m[1], 10), hv: null });
+    }
+  }
+
+  return results;
 }
 
 
@@ -218,9 +236,9 @@ export function useBleDetector({ onCountReceived } = {}) {
       queueTimerRef.current = null;   // queue empty — drainer stops
       return;
     }
-    const count = countQueueRef.current.shift();
-    dispatch({ type: 'LIVE_COUNT', payload: count });
-    onCountReceived?.(count);
+    const frame = countQueueRef.current.shift();  // { count, hv }
+    dispatch({ type: 'LIVE_COUNT', payload: frame });
+    onCountReceived?.(frame.count);
     // Schedule next drain in 1 s
     queueTimerRef.current = setTimeout(_drainQueue, 1000);
   }
@@ -320,12 +338,12 @@ export function useBleDetector({ onCountReceived } = {}) {
           return;
         }
         const raw = decodeCharacteristicValue(characteristic?.value);
-        const counts = parseCountValues(raw);
-        if (counts.length > 0) {
-          console.log('[BLE] Queuing counts:', counts);
-          _enqueueCounts(counts);
+        const frames = parseFrame(raw);
+        if (frames.length > 0) {
+          console.log('[BLE] Queuing frames:', frames);
+          _enqueueCounts(frames);
         } else {
-          console.warn('[BLE] No counts parsed from frame:', JSON.stringify(raw));
+          console.warn('[BLE] No data parsed from frame:', JSON.stringify(raw));
         }
       }
     );
@@ -537,6 +555,7 @@ export function useBleDetector({ onCountReceived } = {}) {
     status:          state.status,
     connectedDevice: state.connectedDevice,
     liveCount:       state.liveCount,
+    liveHV:          state.liveHV,         // ← current HV in Volts from device
     errorMessage:    state.errorMessage,
     isScanning:      state.isScanning,
     isConnected:     state.status === BLE_STATUS.MONITORING,

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * GM Counting System — App.js
  * Visual design matches the NUCLEONIX GC-602A physical instrument.
  *
@@ -40,12 +40,12 @@ import { useBleDetector } from './hooks/useBleDetector';
 LogBox.ignoreLogs(['Cannot record touch move without a touch start']);
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-const DATABASE_NAME    = 'NP.db';
-const HV_MIN           = 0;
-const HV_MAX           = 1500;
-const DEFAULT_HV       = 400;
-const DEFAULT_PR_TIME  = 10;
-const COUNT_RATE       = 127;
+const DATABASE_NAME = 'NP.db';
+const HV_MIN = 0;
+const HV_MAX = 1500;
+const DEFAULT_HV = 400;
+const DEFAULT_PR_TIME = 10;
+const COUNT_RATE = 127;
 
 const ACQ_LABELS = {
   PRESET_TIME: 'PRESET TIME',
@@ -55,40 +55,40 @@ const ACQ_LABELS = {
 
 const ACQ_MODE_ORDER = ['PRESET_TIME', 'CPS', 'CPM'];
 
-const PROG_OFF              = 'OFF';
-const PROG_ACQ_SELECT       = 'ACQ_SELECT';
-const PROG_TIME_ADJUST      = 'TIME_ADJUST';
-const PROG_READINGS_ADJUST  = 'READINGS_ADJUST';
+const PROG_OFF = 'OFF';
+const PROG_ACQ_SELECT = 'ACQ_SELECT';
+const PROG_TIME_ADJUST = 'TIME_ADJUST';
+const PROG_READINGS_ADJUST = 'READINGS_ADJUST';
 const PROG_ITERATION_ADJUST = 'ITERATION_ADJUST';
-const PROG_DHV_ADJUST       = 'DHV_ADJUST';
-const PROG_SAVE_CONFIRM     = 'SAVE_CONFIRM';
-const PROG_SHOW_OK          = 'SHOW_OK';
+const PROG_DHV_ADJUST = 'DHV_ADJUST';
+const PROG_SAVE_CONFIRM = 'SAVE_CONFIRM';
+const PROG_SHOW_OK = 'SHOW_OK';
 
-const PROG_DATA_STORE  = 'DATA_STORE';
+const PROG_DATA_STORE = 'DATA_STORE';
 const PROG_DATA_OUTPUT = 'DATA_OUTPUT';
 const PROG_DATA_RECALL = 'DATA_RECALL';
-const PROG_DATA_ERASE  = 'DATA_ERASE';
-const PROG_SET_HV      = 'SET_HV';        // set base HV before saving
+const PROG_DATA_ERASE = 'DATA_ERASE';
+const PROG_SET_HV = 'SET_HV';        // set base HV before saving
 
 const PROG_DATA_SUBS = [PROG_DATA_STORE, PROG_DATA_OUTPUT, PROG_DATA_RECALL, PROG_DATA_ERASE];
 
-const BOOT_GEIGER    = 'BOOT_GEIGER';
+const BOOT_GEIGER = 'BOOT_GEIGER';
 const BOOT_NUCLEONIX = 'BOOT_NUCLEONIX';
-const BOOT_READY     = 'BOOT_READY';
+const BOOT_READY = 'BOOT_READY';
 
-const STORE_MODE_AUTO    = 'AUTO';
-const STORE_MODE_MANUAL  = 'MANUAL';
-const OUTPUT_ROUTE_USB     = 'USB_PC';
+const STORE_MODE_AUTO = 'AUTO';
+const STORE_MODE_MANUAL = 'MANUAL';
+const OUTPUT_ROUTE_USB = 'USB_PC';
 const OUTPUT_ROUTE_PRINTER = 'PRINTER_D25';
-const OUTPUT_ROUTE_LABELS  = {
-  [OUTPUT_ROUTE_USB]:     'USB SERIAL → PC',
+const OUTPUT_ROUTE_LABELS = {
+  [OUTPUT_ROUTE_USB]: 'USB SERIAL → PC',
   [OUTPUT_ROUTE_PRINTER]: '25-PIN D → PRINTER',
 };
 
-const PARAM_FIELD_TIMER      = 'TIMER';
-const PARAM_FIELD_READINGS   = 'READINGS';
+const PARAM_FIELD_TIMER = 'TIMER';
+const PARAM_FIELD_READINGS = 'READINGS';
 const PARAM_FIELD_ITERATIONS = 'ITERATIONS';
-const PARAM_FIELD_DHV        = 'DHV';
+const PARAM_FIELD_DHV = 'DHV';
 
 const numToDigits = (n) => {
   const s = String(Math.max(0, Math.min(9999, n))).padStart(4, '0');
@@ -100,7 +100,7 @@ const digitsToNum = (d) => Math.max(1, d[0] * 1000 + d[1] * 100 + d[2] * 10 + d[
 export const GMContext = createContext(null);
 
 function GMProvider({ children }) {
-  const [hv, setHv]       = useState(DEFAULT_HV);
+  const [hv, setHv] = useState(DEFAULT_HV);
   const [screen, setScreen] = useState('connect');
 
   const countCallbackRef = useRef(null);
@@ -143,74 +143,79 @@ function GMCountingScreen() {
     return () => clearInterval(iv);
   }, [hv]);
 
-  const [bootStage, setBootStage]             = useState(BOOT_GEIGER);
-  const [storeDataMode, setStoreDataMode]     = useState(STORE_MODE_AUTO);
-  const [outputRoute, setOutputRoute]         = useState(OUTPUT_ROUTE_USB);
-  const [storedReadings, setStoredReadings]   = useState([]);
-  const [recallIndex, setRecallIndex]         = useState(-1);
+  const [bootStage, setBootStage] = useState(BOOT_GEIGER);
+  const [storeDataMode, setStoreDataMode] = useState(STORE_MODE_AUTO);
+  const [outputRoute, setOutputRoute] = useState(OUTPUT_ROUTE_USB);
+  const [storedReadings, setStoredReadings] = useState([]);
+  const [recallIndex, setRecallIndex] = useState(-1);
   const [recallIterIndex, setRecallIterIndex] = useState(0);
   const [pendingMeasurement, setPendingMeasurement] = useState(null);
-  const [flashMessage, setFlashMessage]       = useState('');
-  const [isBleMenuOpen, setIsBleMenuOpen]     = useState(false);
+  const [flashMessage, setFlashMessage] = useState('');
+  const [isBleMenuOpen, setIsBleMenuOpen] = useState(false);
 
 
-  const nextSerialNoRef    = useRef(1);
-  const dbRef              = useRef(null);
-  const flashTimeoutRef    = useRef(null);
+  const nextSerialNoRef = useRef(1);
+  const dbRef = useRef(null);
+  const flashTimeoutRef = useRef(null);
   const rearPanelConfigRef = useRef({
-    detectorInput:     'MHV SOCKET',
-    powerInput:        '+12V ADAPTOR',
-    printerPort:       '25-PIN D CONNECTOR',
-    powerConnected:    true,
+    detectorInput: 'MHV SOCKET',
+    powerInput: '+12V ADAPTOR',
+    printerPort: '25-PIN D CONNECTOR',
+    powerConnected: true,
     detectorConnected: true,
   });
 
-  const [acqMode, setAcqMode]           = useState('PRESET_TIME');
+  const [acqMode, setAcqMode] = useState('PRESET_TIME');
   const [draftAcqMode, setDraftAcqMode] = useState('PRESET_TIME');
-  const [progSub, setProgSub]           = useState(PROG_OFF);
-  const [cursorPos, setCursorPos]       = useState(0);
-  const [draftDigits, setDraftDigits]   = useState([0, 0, 1, 0]);
+  const [progSub, setProgSub] = useState(PROG_OFF);
+  const [cursorPos, setCursorPos] = useState(0);
+  const [draftDigits, setDraftDigits] = useState([0, 0, 1, 0]);
   const [hvCursorPos, setHvCursorPos] = useState(0);
   const [draftHvDigits, setDraftHvDigits] = useState([0, 4, 0, 0]);
   const okTimeoutRef = useRef(null);
 
   const DEFAULT_ITERATIONS = 1;
-  const [iterations, setIterations]           = useState(DEFAULT_ITERATIONS);
+  const [iterations, setIterations] = useState(DEFAULT_ITERATIONS);
   const [draftIterations, setDraftIterations] = useState(DEFAULT_ITERATIONS);
-  const [dHv, setDHv]         = useState(0);
+  const [dHv, setDHv] = useState(0);
   const [draftDHv, setDraftDHv] = useState(0);
   const [activeParamField, setActiveParamField] = useState(PARAM_FIELD_TIMER);
 
   const [currentIteration, setCurrentIteration] = useState(0);
   const iterationResultsRef = useRef([]);
-  const programSessionRef   = useRef(null);
+  const programSessionRef = useRef(null);
 
-  const [counts, setCounts]                   = useState(0);
+  const [counts, setCounts] = useState(0);
   const [displayedCounts, setDisplayedCounts] = useState(0);
-  const [presetTime, setPresetTime]           = useState(DEFAULT_PR_TIME);
-  const [isRunning, setIsRunning]             = useState(false);
-  const [elapsedTime, setElapsedTime]         = useState(0);
-  const [runningTotal, setRunningTotal]       = useState(0);  // cumulative PRESET_TIME sum across all iterations
+  // Frozen final results shown after execution ends
+  const [finalResult, setFinalResult] = useState(null);  // null = no run yet
+  const [finalHV, setFinalHV] = useState(null);          // HV snapshot at stop
+  const [presetTime, setPresetTime] = useState(DEFAULT_PR_TIME);
+  const [isRunning, setIsRunning] = useState(false);
+  const [elapsedTime, setElapsedTime] = useState(0);
+  const [runningTotal, setRunningTotal] = useState(0);  // cumulative PRESET_TIME sum across all iterations
   const [iterationRestartToken, setIterationRestartToken] = useState(0);
-  const [blinkOn, setBlinkOn]                 = useState(true);  // blinking 'A' during counting
+  const [blinkOn, setBlinkOn] = useState(true);  // blinking 'A' during counting
   const blinkTimerRef = useRef(null);
 
-  const intervalRef        = useRef(null);
-  const windowCountsRef    = useRef(0);
-  const windowElapsedRef   = useRef(0);
-  const cpmHistoryRef      = useRef([]);
+  const intervalRef = useRef(null);
+  const windowCountsRef = useRef(0);
+  const windowElapsedRef = useRef(0);
+  const cpmHistoryRef = useRef([]);
   const displayedCountsRef = useRef(0);
-  const elapsedTimeRef     = useRef(0);
-  const bleIsConnectedRef  = useRef(false);
-  const isRunningRef       = useRef(false);
-  const acqModeRef         = useRef('PRESET_TIME');  // tracks acqMode for use inside BLE callback
-  const bleCpsRef          = useRef(0);              // latest raw CPS from BLE (separate from CPM result)
+  const elapsedTimeRef = useRef(0);
+  const bleIsConnectedRef = useRef(false);
+  const isRunningRef = useRef(false);
+  const acqModeRef = useRef('PRESET_TIME');  // tracks acqMode for use inside BLE callback
+  const bleCpsRef = useRef(0);              // latest raw CPS from BLE (separate from CPM result)
+  const liveHVRef = useRef(null);           // always-fresh liveHV for freezing at stop
 
   const { countCallbackRef, ble } = useContext(GMContext);
 
   useEffect(() => { bleIsConnectedRef.current = ble.isConnected; }, [ble.isConnected]);
   useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
   useEffect(() => { acqModeRef.current = acqMode; }, [acqMode]);
+  useEffect(() => { liveHVRef.current = ble.liveHV; }, [ble.liveHV]);
 
   useEffect(() => {
     countCallbackRef.current = (count) => {
@@ -255,7 +260,7 @@ function GMCountingScreen() {
         'ALTER TABLE measurements ADD COLUMN detectorInput TEXT;',
         'ALTER TABLE measurements ADD COLUMN powerInput TEXT;',
       ];
-      for (const sql of cols) { try { db.execSync(sql); } catch (_) {} }
+      for (const sql of cols) { try { db.execSync(sql); } catch (_) { } }
 
       const rows = db.getAllSync('SELECT * FROM measurements ORDER BY serialNo ASC');
       if (rows && rows.length > 0) {
@@ -280,9 +285,9 @@ function GMCountingScreen() {
 
   useEffect(() => {
     return () => {
-      if (okTimeoutRef.current)    clearTimeout(okTimeoutRef.current);
+      if (okTimeoutRef.current) clearTimeout(okTimeoutRef.current);
       if (flashTimeoutRef.current) clearTimeout(flashTimeoutRef.current);
-      if (blinkTimerRef.current)   clearInterval(blinkTimerRef.current);
+      if (blinkTimerRef.current) clearInterval(blinkTimerRef.current);
     };
   }, []);
 
@@ -378,7 +383,7 @@ function GMCountingScreen() {
       iterationResults: [...iterationResultsRef.current],
       hv, storeDataMode, outputRoute,
       detectorInput: rearPanelConfigRef.current.detectorInput,
-      powerInput:    rearPanelConfigRef.current.powerInput,
+      powerInput: rearPanelConfigRef.current.powerInput,
     };
     if (storeDataMode === STORE_MODE_AUTO) {
       appendStoredMeasurement(m);
@@ -418,9 +423,12 @@ function GMCountingScreen() {
                 }, 1000);
                 return 0;   // reset immediately so runningSum shows correct cumulative during pause
               } else {
-                const total = iterationResultsRef.current.reduce((a, b) => a + b.count, 0);
+                const iters = iterationResultsRef.current;
+                const total = iters.reduce((a, b) => a + b.count, 0);
                 displayedCountsRef.current = total;
                 setDisplayedCounts(total);
+                setFinalResult(total);          // PRESET_TIME: show total counts directly
+                setFinalHV(liveHVRef.current ?? hv);
                 setCurrentIteration(0);
                 setIsRunning(false);
                 queueMeasurement(total);
@@ -451,10 +459,10 @@ function GMCountingScreen() {
       } else if (acqMode === 'CPM') {
         elapsedTimeRef.current += 1;
         setElapsedTime((t) => t + 1);
-        
+
         const currentCps = bleIsConnectedRef.current ? bleCpsRef.current : tick;
         cpmHistoryRef.current.push(currentCps);
-        
+
         // 5 second sliding window, updating every 2 seconds
         if (cpmHistoryRef.current.length >= 5) {
           if ((cpmHistoryRef.current.length - 5) % 2 === 0) {
@@ -482,35 +490,35 @@ function GMCountingScreen() {
       else { setCursorPos(0); setProgSub(PROG_TIME_ADJUST); setActiveParamField(PARAM_FIELD_TIMER); }
       return;
     }
-    if (progSub === PROG_TIME_ADJUST)      { setProgSub(PROG_READINGS_ADJUST); setActiveParamField(PARAM_FIELD_READINGS); return; }
-    if (progSub === PROG_READINGS_ADJUST)  {
+    if (progSub === PROG_TIME_ADJUST) { setProgSub(PROG_READINGS_ADJUST); setActiveParamField(PARAM_FIELD_READINGS); return; }
+    if (progSub === PROG_READINGS_ADJUST) {
       // CPS/CPM skip ITERATION and DHV steps — so they go straight to SET_HV then DATA_STORE
       if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') { setDraftHvDigits(numToDigits(hv)); setHvCursorPos(0); setProgSub(PROG_SET_HV); }
       else { setProgSub(PROG_ITERATION_ADJUST); setActiveParamField(PARAM_FIELD_ITERATIONS); }
       return;
     }
     if (progSub === PROG_ITERATION_ADJUST) { setDraftHvDigits(numToDigits(hv)); setHvCursorPos(0); setProgSub(PROG_SET_HV); return; }
-    if (progSub === PROG_SET_HV)           {
+    if (progSub === PROG_SET_HV) {
       const newHv = digitsToNum(draftHvDigits);
       setHv(newHv);
       // ── Send HV command to scintillator device ──────────────────────────
       if (ble.isConnected) {
-        const cmd = `STHV ${newHv}`;
+        const cmd = `STHV ${newHv}!`;
         ble.sendCommand(cmd).then((ok) => {
           if (ok) showFlashMessage(`HV SET: ${newHv}V`);
-          else    showFlashMessage('HV CMD FAILED');
+          else showFlashMessage('HV CMD FAILED');
         });
       }
       if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') setProgSub(PROG_DATA_STORE);
       else { setProgSub(PROG_DHV_ADJUST); setActiveParamField(PARAM_FIELD_DHV); }
       return;
     }
-    if (progSub === PROG_DHV_ADJUST)       { setProgSub(PROG_DATA_STORE); return; }  // data subs first
-    if (progSub === PROG_DATA_STORE)       { setProgSub(PROG_DATA_OUTPUT); return; }  // Export step before recall
-    if (progSub === PROG_DATA_OUTPUT)      { setRecallIndex(storedReadings.length > 0 ? storedReadings.length - 1 : -1); setRecallIterIndex(0); setProgSub(PROG_DATA_RECALL); return; }
-    if (progSub === PROG_DATA_RECALL)      { setProgSub(PROG_DATA_ERASE); return; }
-    if (progSub === PROG_DATA_ERASE)       { setProgSub(PROG_SAVE_CONFIRM); return; }  // SAVE is last
-    if (progSub === PROG_SAVE_CONFIRM)     { discardProgrammingSession(); }            // PROG → discard & exit
+    if (progSub === PROG_DHV_ADJUST) { setProgSub(PROG_DATA_STORE); return; }  // data subs first
+    if (progSub === PROG_DATA_STORE) { setProgSub(PROG_DATA_OUTPUT); return; }  // Export step before recall
+    if (progSub === PROG_DATA_OUTPUT) { setRecallIndex(storedReadings.length > 0 ? storedReadings.length - 1 : -1); setRecallIterIndex(0); setProgSub(PROG_DATA_RECALL); return; }
+    if (progSub === PROG_DATA_RECALL) { setProgSub(PROG_DATA_ERASE); return; }
+    if (progSub === PROG_DATA_ERASE) { setProgSub(PROG_SAVE_CONFIRM); return; }  // SAVE is last
+    if (progSub === PROG_SAVE_CONFIRM) { discardProgrammingSession(); }            // PROG → discard & exit
   };
 
   // ── Erase (defined here so handleUp/Down can reference it) ──────────────
@@ -531,12 +539,12 @@ function GMCountingScreen() {
   // ── ▲ / ▼ ────────────────────────────────────────────────────────────────
   const handleUp = () => {
     if (isRunning || bootStage !== BOOT_READY || flashMessage) return;
-    if (progSub === PROG_DATA_STORE)  { setStoreDataMode((m) => m === STORE_MODE_AUTO ? STORE_MODE_MANUAL : STORE_MODE_AUTO); return; }
+    if (progSub === PROG_DATA_STORE) { setStoreDataMode((m) => m === STORE_MODE_AUTO ? STORE_MODE_MANUAL : STORE_MODE_AUTO); return; }
     if (progSub === PROG_DATA_OUTPUT) { handleExportDB(); return; }   // ▲ = confirm export
     if (progSub === PROG_DATA_RECALL) {
       if (storedReadings.length === 0) return;
       const _entry = storedReadings[recallIndex >= 0 ? recallIndex : 0];
-      const _iLen  = _entry ? (_entry.iterationResults || []).length : 0;
+      const _iLen = _entry ? (_entry.iterationResults || []).length : 0;
       if (_iLen > 1 && recallIterIndex < _iLen - 1) {
         setRecallIterIndex((i) => i + 1);
       } else {
@@ -545,39 +553,49 @@ function GMCountingScreen() {
       }
       return;
     }
-    if (progSub === PROG_DATA_ERASE)  { handleEraseData(); return; }
-    if (progSub === PROG_SET_HV)      { setDraftHvDigits((p) => { const n = [...p]; n[hvCursorPos] = hvCursorPos === 0 ? (n[hvCursorPos] + 1) % 2 : (n[hvCursorPos] + 1) % 10; return n; }); return; }
-    if (progSub === PROG_ACQ_SELECT)       { setDraftAcqMode((m) => ACQ_MODE_ORDER[(ACQ_MODE_ORDER.indexOf(m) + 1) % ACQ_MODE_ORDER.length]); }
+    if (progSub === PROG_DATA_ERASE) { handleEraseData(); return; }
+    if (progSub === PROG_SET_HV) {
+      setDraftHvDigits((p) => {
+        const n = [...p];
+        n[hvCursorPos] = hvCursorPos === 0 ? (n[hvCursorPos] + 1) % 2 : (n[hvCursorPos] + 1) % 10;
+        return n;
+      });
+      return;
+    }
+    if (progSub === PROG_ACQ_SELECT) { setDraftAcqMode((m) => ACQ_MODE_ORDER[(ACQ_MODE_ORDER.indexOf(m) + 1) % ACQ_MODE_ORDER.length]); }
     else if (progSub === PROG_TIME_ADJUST) { setDraftDigits((p) => { const n = [...p]; n[cursorPos] = (n[cursorPos] + 1) % 10; return n; }); }
     else if (progSub === PROG_ITERATION_ADJUST) { setDraftIterations((n) => Math.min(n + 1, 20)); }
-    else if (progSub === PROG_DHV_ADJUST)       { setDraftDHv((v) => Math.min(v + 5, 100)); }
-    else if (progSub === PROG_SAVE_CONFIRM)     { commitProgrammingSession(); }
+    else if (progSub === PROG_DHV_ADJUST) { setDraftDHv((v) => Math.min(v + 5, 100)); }
+    else if (progSub === PROG_SAVE_CONFIRM) { commitProgrammingSession(); }
   };
 
   const handleDown = () => {
     if (isRunning || bootStage !== BOOT_READY || flashMessage) return;
-    if (progSub === PROG_DATA_STORE)  { setStoreDataMode((m) => m === STORE_MODE_AUTO ? STORE_MODE_MANUAL : STORE_MODE_AUTO); return; }
+    if (progSub === PROG_DATA_STORE) { setStoreDataMode((m) => m === STORE_MODE_AUTO ? STORE_MODE_MANUAL : STORE_MODE_AUTO); return; }
     if (progSub === PROG_DATA_OUTPUT) { setOutputRoute((r) => r === OUTPUT_ROUTE_USB ? OUTPUT_ROUTE_PRINTER : OUTPUT_ROUTE_USB); return; }  // ▼ = toggle route
     if (progSub === PROG_DATA_RECALL) {
       if (storedReadings.length === 0) return;
       if (recallIterIndex > 0) {
         setRecallIterIndex((i) => i - 1);
       } else {
-        const prevIdx   = Math.max(recallIndex - 1, 0);
+        const prevIdx = Math.max(recallIndex - 1, 0);
         const prevEntry = storedReadings[prevIdx];
-        const prevILen  = prevEntry ? (prevEntry.iterationResults || []).length : 0;
+        const prevILen = prevEntry ? (prevEntry.iterationResults || []).length : 0;
         setRecallIndex(prevIdx);
         setRecallIterIndex(prevILen > 1 ? prevILen - 1 : 0);
       }
       return;
     }
-    if (progSub === PROG_DATA_ERASE)  { handleEraseData(); return; }
-    if (progSub === PROG_SET_HV)      { setHvCursorPos((p) => (p === 0 ? 3 : p - 1)); return; }
-    if (progSub === PROG_ACQ_SELECT)       { setDraftAcqMode((m) => ACQ_MODE_ORDER[(ACQ_MODE_ORDER.indexOf(m) - 1 + ACQ_MODE_ORDER.length) % ACQ_MODE_ORDER.length]); }
+    if (progSub === PROG_DATA_ERASE) { handleEraseData(); return; }
+    if (progSub === PROG_SET_HV) {
+      setHvCursorPos((p) => (p === 0 ? 3 : p - 1));
+      return;
+    }
+    if (progSub === PROG_ACQ_SELECT) { setDraftAcqMode((m) => ACQ_MODE_ORDER[(ACQ_MODE_ORDER.indexOf(m) - 1 + ACQ_MODE_ORDER.length) % ACQ_MODE_ORDER.length]); }
     else if (progSub === PROG_TIME_ADJUST) { setCursorPos((p) => (p === 0 ? 3 : p - 1)); }
     else if (progSub === PROG_ITERATION_ADJUST) { setDraftIterations((n) => Math.max(n - 1, 1)); }
-    else if (progSub === PROG_DHV_ADJUST)       { setDraftDHv((v) => Math.max(v - 5, 0)); }
-    else if (progSub === PROG_SAVE_CONFIRM)     { commitProgrammingSession(); }
+    else if (progSub === PROG_DHV_ADJUST) { setDraftDHv((v) => Math.max(v - 5, 0)); }
+    else if (progSub === PROG_SAVE_CONFIRM) { commitProgrammingSession(); }
   };
 
   // ── START / STOP ─────────────────────────────────────────────────────────
@@ -588,6 +606,7 @@ function GMCountingScreen() {
       return;
     }
     setCounts(0); displayedCountsRef.current = 0; setDisplayedCounts(0);
+    setFinalResult(null); setFinalHV(null);
     elapsedTimeRef.current = 0; setElapsedTime(0); setRunningTotal(0);
     windowCountsRef.current = 0; windowElapsedRef.current = 0; cpmHistoryRef.current = [];
     iterationResultsRef.current = [];
@@ -595,12 +614,53 @@ function GMCountingScreen() {
     programSessionRef.current = null;
     setProgSub(PROG_OFF);
     setIsRunning(true);
+    // ── Send START command to detector ──────────────────────────────────────
+    if (ble.isConnected) {
+      ble.sendCommand('SRTC!').then((ok) => {
+        if (!ok) console.warn('[BLE] SRTC command failed');
+        else console.log('[BLE] SRTC sent');
+      });
+    }
   };
 
   const handleSTP = () => {
     clearInterval(intervalRef.current);
+    // ── Compute frozen final values BEFORE setIsRunning(false) ──────────────
+    // (isRunningRef is still true here, so BLE callbacks are still gated)
+    const hvSnapshot = liveHVRef.current ?? hv;
+    setFinalHV(hvSnapshot);
+
+    if (acqMode === 'CPS') {
+      // Sum of all per-second counts = total counts over the run
+      const totalCounts = iterationResultsRef.current.reduce((a, b) => a + (b.count ?? 0), 0);
+      setFinalResult(totalCounts);
+      queueMeasurement(totalCounts);
+    } else if (acqMode === 'CPM') {
+      // Last 5-second window × 12 = CPM  (same algorithm used during run)
+      const last5 = cpmHistoryRef.current.slice(-5);
+      const cpmFinal = last5.length > 0
+        ? Math.round(last5.reduce((a, b) => a + b, 0) * 12)
+        : 0;
+      setFinalResult(cpmFinal);
+      queueMeasurement(cpmFinal);
+    } else if (acqMode === 'PRESET_TIME') {
+      // Direct total count (early manual stop)
+      const iters = iterationResultsRef.current;
+      const total = iters.length > 0
+        ? iters.reduce((a, b) => a + b.count, 0)
+        : 0;
+      setFinalResult(total);
+      queueMeasurement(total);
+    }
+
     setIsRunning(false);
-    if (acqMode === 'CPS' || acqMode === 'CPM') queueMeasurement(displayedCountsRef.current);
+    // ── Send STOP command to detector ───────────────────────────────────────
+    if (ble.isConnected) {
+      ble.sendCommand('STPC!').then((ok) => {
+        if (!ok) console.warn('[BLE] STPC command failed');
+        else console.log('[BLE] STPC sent');
+      });
+    }
   };
 
   // ── STORE ────────────────────────────────────────────────────────────────
@@ -622,8 +682,8 @@ function GMCountingScreen() {
 
   const handleExportDB = async () => {
     try {
-      if (dbRef.current) { try { dbRef.current.execSync('PRAGMA wal_checkpoint(TRUNCATE);'); } catch (_) {} }
-      const uri  = `${FileSystem.documentDirectory}SQLite/${DATABASE_NAME}`;
+      if (dbRef.current) { try { dbRef.current.execSync('PRAGMA wal_checkpoint(TRUNCATE);'); } catch (_) { } }
+      const uri = `${FileSystem.documentDirectory}SQLite/${DATABASE_NAME}`;
       const info = await FileSystem.getInfoAsync(uri);
       if (!info.exists) { Alert.alert('Export Error', 'No database found.'); return; }
       if (Platform.OS === 'android') {
@@ -634,9 +694,9 @@ function GMCountingScreen() {
           try {
             const files = await FileSystem.StorageAccessFramework.readDirectoryAsync(perm.directoryUri);
             for (const f of files) { if (f.endsWith(DATABASE_NAME)) await FileSystem.deleteAsync(f, { idempotent: true }); }
-          } catch (_) {}
-          const tgt    = await FileSystem.StorageAccessFramework.createFileAsync(perm.directoryUri, DATABASE_NAME, 'application/x-sqlite3');
-          const b64    = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+          } catch (_) { }
+          const tgt = await FileSystem.StorageAccessFramework.createFileAsync(perm.directoryUri, DATABASE_NAME, 'application/x-sqlite3');
+          const b64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
           await FileSystem.writeAsStringAsync(tgt, b64, { encoding: FileSystem.EncodingType.Base64 });
           Alert.alert('Export Complete', `${DATABASE_NAME} saved.`);
           return;
@@ -655,25 +715,38 @@ function GMCountingScreen() {
     ? Math.max(presetTime - elapsedTime, 0)
     : acqMode === 'CPM' ? Math.max(60 - windowElapsedRef.current, 0) : 0;
 
-  const runningSum = iterationResultsRef.current.reduce((a, b) => a + (b.count ?? 0), 0) + counts;
-  const displayResult = (acqMode === 'CPS' || acqMode === 'CPM')
-    ? displayedCounts
-    : (acqMode === 'PRESET_TIME' && isRunning) ? runningTotal
-    : (!isRunning && iterationResultsRef.current.length > 0) ? displayedCounts
-    : counts;
+  // displayResult: applies the same aggregation formula live AND frozen after stop.
+  //   PRESET_TIME → running average of iteration counts
+  //   CPS         → running sum of all per-second counts
+  //   CPM         → last 5-second window × 12  (displayedCounts already holds this)
+  const _completedIterSum = iterationResultsRef.current.reduce((a, b) => a + (b.count ?? 0), 0);
+  const _liveDisplay = acqMode === 'PRESET_TIME'
+    ? runningTotal          // PRESET_TIME: direct cumulative count
+    : acqMode === 'CPS'
+      ? _completedIterSum   // running sum of per-second readings
+      : displayedCounts;    // CPM: 5-sec window × 12, already computed in interval
 
-  const isBooting      = bootStage !== BOOT_READY;
-  const isProgOn       = progSub !== PROG_OFF;
-  const isDataSubMode  = PROG_DATA_SUBS.includes(progSub);
+  const displayResult = isRunning
+    ? _liveDisplay
+    : (finalResult !== null ? finalResult : counts);  // fallback before first run
+
+  const isBooting = bootStage !== BOOT_READY;
+  const isProgOn = progSub !== PROG_OFF;
+  const isDataSubMode = PROG_DATA_SUBS.includes(progSub);
   const isProgEditMode = isProgOn && !isDataSubMode && progSub !== PROG_SHOW_OK;
-  const memoryCount    = storedReadings.length;
+  const memoryCount = storedReadings.length;
   const currentRecallEntry = recallIndex >= 0 ? storedReadings[recallIndex] : null;
   const displayAcqMode = isProgEditMode ? draftAcqMode : acqMode;
   const draftPresetTime = digitsToNum(draftDigits);
 
   const formatCounts = (n) => String(n).padStart(6, '0');
   const formatPRTime = (n) => String(n).padStart(4, '0');
-  const formatHV4    = (n) => typeof n === 'number' ? String(n).padStart(4, '0') : '----';
+  const formatHV4 = (n) => typeof n === 'number' ? String(n).padStart(4, '0') : '----';
+
+  // HV display: live when running, frozen at stop time, falls back to set HV
+  const displayHV = isRunning
+    ? (ble.isConnected && ble.liveHV != null ? ble.liveHV : hv)
+    : (finalHV !== null ? finalHV : hv);
 
   // Recall computed values
   // PRESET_TIME → sum of all iteration counts
@@ -717,32 +790,32 @@ function GMCountingScreen() {
 
   // PROG sub-mode icon — full 10-step cycle (SET_HV is 5th now)
   const progSubIcon =
-    progSub === PROG_ACQ_SELECT        ? '①' : progSub === PROG_TIME_ADJUST     ? '②'
-    : progSub === PROG_READINGS_ADJUST ? '③' : progSub === PROG_ITERATION_ADJUST? '④'
-    : progSub === PROG_SET_HV          ? '⑤' : progSub === PROG_DHV_ADJUST      ? '⑥'
-    : progSub === PROG_DATA_STORE      ? '⑦' : progSub === PROG_DATA_OUTPUT     ? '⑧'
-    : progSub === PROG_DATA_RECALL     ? '⑨' : progSub === PROG_DATA_ERASE      ? '⑩'
-    : progSub === PROG_SAVE_CONFIRM    ? '⑪' : '✓';
+    progSub === PROG_ACQ_SELECT ? '①' : progSub === PROG_TIME_ADJUST ? '②'
+      : progSub === PROG_READINGS_ADJUST ? '③' : progSub === PROG_ITERATION_ADJUST ? '④'
+        : progSub === PROG_SET_HV ? '⑤' : progSub === PROG_DHV_ADJUST ? '⑥'
+          : progSub === PROG_DATA_STORE ? '⑦' : progSub === PROG_DATA_OUTPUT ? '⑧'
+            : progSub === PROG_DATA_RECALL ? '⑨' : progSub === PROG_DATA_ERASE ? '⑩'
+              : progSub === PROG_SAVE_CONFIRM ? '⑪' : '✓';
 
   // Hint bar
   const progLabel =
-    isBooting                          ? 'Boot sequence in progress'
-    : flashMessage                     ? flashMessage
-    : progSub === PROG_ACQ_SELECT      ? '▲ / ▼ → Select ACQ Mode  ·  PROG → Next'
-    : progSub === PROG_TIME_ADJUST     ? '▲ → Increment digit  ·  ▼ → Move cursor  ·  PROG → Next'
-    : progSub === PROG_READINGS_ADJUST ? 'READINGS shows MEM count (read-only)  ·  PROG → Next'
-    : progSub === PROG_ITERATION_ADJUST? '▲/▼ set iterations (1–9)  ·  PROG → Next'
-    : progSub === PROG_DHV_ADJUST      ? '▲/▼ set delta HV step  ·  PROG → Next'
-    : progSub === PROG_SAVE_CONFIRM    ? '▲ or ▼ → SAVE  ·  PROG → Discard & Continue'
-    : progSub === PROG_SHOW_OK         ? 'Settings saved!'
-    : progSub === PROG_DATA_STORE      ? '▲ / ▼ → Toggle AUTO/MANUAL  ·  PROG → Next'
-    : progSub === PROG_DATA_OUTPUT     ? '▲ → EXPORT  ·  ▼ → Change route  ·  PROG → Skip'
-    : progSub === PROG_DATA_RECALL     ? '▲ / ▼ → Navigate experiments  ·  PROG → Next'
-    : progSub === PROG_DATA_ERASE      ? '▲ or ▼ → CONFIRM ERASE  ·  PROG → Cancel erase'
-    : progSub === PROG_SET_HV          ? `▲ +${hvStep}V  ·  ▼ -${hvStep}V  ·  STORE ⇄ ${hvStep === 30 ? 50 : 30}V step  ·  PROG → Next`
-    : storeDataMode === STORE_MODE_MANUAL
-      ? 'STORE → save pending  ·  PROG → programming mode'
-      : 'PROG → enter programming mode';
+    isBooting ? 'Boot sequence in progress'
+      : flashMessage ? flashMessage
+        : progSub === PROG_ACQ_SELECT ? '▲ / ▼ → Select ACQ Mode  ·  PROG → Next'
+          : progSub === PROG_TIME_ADJUST ? '▲ → Increment digit  ·  ▼ → Move cursor  ·  PROG → Next'
+            : progSub === PROG_READINGS_ADJUST ? 'READINGS shows MEM count (read-only)  ·  PROG → Next'
+              : progSub === PROG_ITERATION_ADJUST ? '▲/▼ set iterations (1–9)  ·  PROG → Next'
+                : progSub === PROG_DHV_ADJUST ? '▲/▼ set delta HV step  ·  PROG → Next'
+                  : progSub === PROG_SAVE_CONFIRM ? '▲ or ▼ → SAVE  ·  PROG → Discard & Continue'
+                    : progSub === PROG_SHOW_OK ? 'Settings saved!'
+                      : progSub === PROG_DATA_STORE ? '▲ / ▼ → Toggle AUTO/MANUAL  ·  PROG → Next'
+                        : progSub === PROG_DATA_OUTPUT ? '▲ → EXPORT  ·  ▼ → Change route  ·  PROG → Skip'
+                          : progSub === PROG_DATA_RECALL ? '▲ / ▼ → Navigate experiments  ·  PROG → Next'
+                            : progSub === PROG_DATA_ERASE ? '▲ or ▼ → CONFIRM ERASE  ·  PROG → Cancel erase'
+                              : progSub === PROG_SET_HV ? `▲ +${hvStep}V  ·  ▼ -${hvStep}V  ·  STORE ⇄ ${hvStep === 30 ? 50 : 30}V step  ·  PROG → Next`
+                                : storeDataMode === STORE_MODE_MANUAL
+                                  ? 'STORE → save pending  ·  PROG → programming mode'
+                                  : 'PROG → enter programming mode';
 
   // ─── Render ───────────────────────────────────────────────────────────────
   return (
@@ -801,7 +874,7 @@ function GMCountingScreen() {
                   <Text style={{ fontFamily: MONO, fontWeight: '900', fontSize: 14, color: '#2a2e00', letterSpacing: 2 }}>
                     ◆ BLE DEVICES ({ble.foundDevices.length})
                   </Text>
-                  <TouchableOpacity onPress={() => setIsBleMenuOpen(false)} hitSlop={{top:8,bottom:8,left:8,right:8}}>
+                  <TouchableOpacity onPress={() => setIsBleMenuOpen(false)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
                     <Text style={{ fontFamily: MONO, fontWeight: '900', fontSize: 12, color: '#6a0000', letterSpacing: 1 }}>[ESC]</Text>
                   </TouchableOpacity>
                 </View>
@@ -848,11 +921,11 @@ function GMCountingScreen() {
               <View style={styles.lcdOverlay}>
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>STORE</Text>
-                  <Text style={styles.lcdPhysRight}>HV</Text>
+                  <Text style={styles.lcdPhysRight}>HV     </Text>
                 </View>
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>{storeDataMode}</Text>
-                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}   </Text>
                 </View>
               </View>
             )}
@@ -862,11 +935,11 @@ function GMCountingScreen() {
               <View style={styles.lcdOverlay}>
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>EXPORT?</Text>
-                  <Text style={styles.lcdPhysRight}>HV</Text>
+                  <Text style={styles.lcdPhysRight}>HV     </Text>
                 </View>
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>DATA</Text>
-                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}   </Text>
                 </View>
               </View>
             )}
@@ -944,11 +1017,11 @@ function GMCountingScreen() {
               <View style={styles.lcdOverlay}>
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>READINGS</Text>
-                  <Text style={styles.lcdPhysRight}>HV</Text>
+                  <Text style={styles.lcdPhysRight}>HV     </Text>
                 </View>
                 <View style={styles.lcdPhysRow}>
-                  <Text style={styles.lcdPhysLeft}>{formatPRTime(memoryCount)}</Text>
-                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                  <Text style={styles.lcdPhysLeft}>{formatPRTime(memoryCount)}  </Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}   </Text>
                 </View>
               </View>
             )}
@@ -958,11 +1031,11 @@ function GMCountingScreen() {
               <View style={styles.lcdOverlay}>
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>ITERATION</Text>
-                  <Text style={styles.lcdPhysRight}>HV</Text>
+                  <Text style={styles.lcdPhysRight}>HV     </Text>
                 </View>
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>{'     '}{draftIterations}</Text>
-                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}   </Text>
                 </View>
               </View>
             )}
@@ -971,12 +1044,12 @@ function GMCountingScreen() {
             {!isBooting && flashMessage === '' && !isBleMenuOpen && progSub === PROG_DHV_ADJUST && (
               <View style={styles.lcdOverlay}>
                 <View style={styles.lcdPhysRow}>
-                  <Text style={styles.lcdPhysLeft}>dHV STEP</Text>
-                  <Text style={styles.lcdPhysRight}>HV</Text>
+                  <Text style={styles.lcdPhysLeft}>STEP  </Text>
+                  <Text style={styles.lcdPhysRight}>HV     </Text>
                 </View>
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>{`+${draftDHv} V`}</Text>
-                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}   </Text>
                 </View>
               </View>
             )}
@@ -986,11 +1059,11 @@ function GMCountingScreen() {
               <View style={styles.lcdOverlay}>
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>ACQ MODE</Text>
-                  <Text style={styles.lcdPhysRight}>HV</Text>
+                  <Text style={styles.lcdPhysRight}>HV     </Text>
                 </View>
                 <View style={styles.lcdPhysRow}>
                   <Text style={styles.lcdPhysLeft}>{ACQ_LABELS[displayAcqMode]}</Text>
-                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}</Text>
+                  <Text style={styles.lcdPhysRight}>{formatHV4(hv)}   </Text>
                 </View>
               </View>
             )}
@@ -1011,14 +1084,16 @@ function GMCountingScreen() {
                         {i === cursorPos
                           ? <Text style={{ fontSize: 16, fontWeight: '900', fontFamily: MONO, lineHeight: 18, color: '#0a2a6a' }}>^</Text>
                           : <View style={{ height: 18 }} />}
-                        <Text style={{ fontSize: 30, fontWeight: '900', fontFamily: MONO,
-                          color: i === cursorPos ? '#0a2a6a' : LCD_TEXT, lineHeight: 36 }}>{d}</Text>
+                        <Text style={{
+                          fontSize: 30, fontWeight: '900', fontFamily: MONO,
+                          color: i === cursorPos ? '#0a2a6a' : LCD_TEXT, lineHeight: 36
+                        }}>{d}</Text>
                       </View>
                     ))}
                   </View>
                   {/* Right HV */}
                   <View style={{ width: 72, alignItems: 'flex-end' }}>
-                    <Text style={{ fontFamily: MONO, fontSize: 13, color: LCD_TEXT, fontWeight: '700', lineHeight: 16 }}>HV</Text>
+                    <Text style={{ fontFamily: MONO, fontSize: 20, color: LCD_TEXT, fontWeight: '900', lineHeight: 24 }}>HV</Text>
                     <Text style={{ fontFamily: MONO, fontSize: 20, color: LCD_TEXT, fontWeight: '900', lineHeight: 24 }}>{formatHV4(hv)}</Text>
                   </View>
                 </View>
@@ -1038,28 +1113,33 @@ function GMCountingScreen() {
               && progSub !== PROG_ACQ_SELECT
               && progSub !== PROG_SET_HV
               && progSub !== PROG_TIME_ADJUST && (
-              <View style={styles.lcdMainContent}>
-                {/* LINE 1: ET+PT (running) or SN+PT (idle) */}
-                <Text style={styles.lcdLine}>
-                  {isRunning
-                    ? (acqMode === 'CPS' || acqMode === 'CPM'
-                        ? `ET${formatPRTime(elapsedTime + 1)}  PT0000${blinkOn ? ' A' : '  '}`
-                        : `ET${formatPRTime(Math.min(elapsedTime + 1, presetTime))}  PT${formatPRTime(presetTime)}${blinkOn ? ' A' : '  '}`)
-                    : `SN${snStr}  PT${ptStr}`}
-                </Text>
-                {/* LINE 2: HV + COUNT */}
-                <Text style={styles.lcdLine}>
-                  {`HV${formatHV4(hv)}  ${formatCounts(displayResult)}`}
-                </Text>
-                {/* Sub-info line: mode + iteration */}
-                <View style={styles.lcdSubRow}>
-                  <Text style={styles.lcdSubText}>{ACQ_LABELS[acqMode]}</Text>
-                  {currentIteration > 0 && isRunning && (
-                    <Text style={styles.lcdSubText}> · Run {currentIteration}/{iterations}</Text>
+                <View style={styles.lcdMainContent}>
+                  {/* LINE 1: ET+PT (running) or SN+PT (idle) */}
+                  {isRunning && (acqMode === 'CPS' || acqMode === 'CPM') ? (
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', paddingLeft: 63, paddingRight: 81 }}>
+                      <Text style={styles.lcdLine}>{acqMode}</Text>
+                      <Text style={styles.lcdLine}>{blinkOn ? 'A' : ' '}</Text>
+                    </View>
+                  ) : (
+                    <Text style={styles.lcdLine} numberOfLines={1}>
+                      {isRunning
+                        ? `   ET${formatPRTime(Math.min(elapsedTime + 1, presetTime))}       PT${formatPRTime(presetTime)}${blinkOn ? ' A' : '  '}`
+                        : `   SN${snStr}       PT${ptStr}`}
+                    </Text>
                   )}
+                  {/* LINE 2: HV + COUNT */}
+                  <Text style={styles.lcdLine} numberOfLines={1}>
+                   {`   HV${formatHV4(displayHV)}       ${formatCounts(displayResult)}`}
+                  </Text>
+                  {/* Sub-info line: mode + iteration */}
+                  <View style={styles.lcdSubRow}>
+                    <Text style={styles.lcdSubText}>{ACQ_LABELS[acqMode]}</Text>
+                    {currentIteration > 0 && isRunning && (
+                      <Text style={styles.lcdSubText}> · Run {currentIteration}/{iterations}</Text>
+                    )}
+                  </View>
                 </View>
-              </View>
-            )}
+              )}
 
           </View>
         </View>
@@ -1124,25 +1204,25 @@ function GMCountingScreen() {
 
 // ─── Design Tokens ────────────────────────────────────────────────────────────
 // Physical device color palette
-const DEVICE_BG   = '#7898b0';   // light steel-blue body (like the aluminum casing)
-const FACE_PANEL  = '#6a8298';   // slightly darker face plate
-const LABEL_TEXT  = '#0a1825';   // dark text on light panel background
-const HINT_TEXT   = '#2a4050';   // medium dark for hint text
+const DEVICE_BG = '#7898b0';   // light steel-blue body (like the aluminum casing)
+const FACE_PANEL = '#6a8298';   // slightly darker face plate
+const LABEL_TEXT = '#0a1825';   // dark text on light panel background
+const HINT_TEXT = '#2a4050';   // medium dark for hint text
 
 // LCD — bright positive display (yellow-green backlit, dark characters)
-const LCD_OUTER   = '#2a2a10';   // dark LCD frame border
-const LCD_BG      = '#c8d400';   // bright yellow-green LCD background
-const LCD_TEXT    = '#1a1a00';   // very dark yellow-tint text
-const LCD_LABEL   = '#3a3a10';   // slightly lighter label text
+const LCD_OUTER = '#2a2a10';   // dark LCD frame border
+const LCD_BG = '#c8d400';   // bright yellow-green LCD background
+const LCD_TEXT = '#1a1a00';   // very dark yellow-tint text
+const LCD_LABEL = '#3a3a10';   // slightly lighter label text
 
 // Button panel (dark navy blue matching physical device button section)
-const BTN_PANEL   = '#3b7782';   // dark teal face panel
-const BTN_BG      = '#162848';   // button background
-const BTN_BORDER  = '#e0f0ff';   // button border directly around button
-const BTN_TEXT    = '#e0f0ff';   // near-white button text
+const BTN_PANEL = '#3b7782';   // dark teal face panel
+const BTN_BG = '#162848';   // button background
+const BTN_BORDER = '#e0f0ff';   // button border directly around button
+const BTN_TEXT = '#e0f0ff';   // near-white button text
 
-const PROG_COLOR  = '#60a5fa';   // PROG mode highlight (blue)
-const MONO        = 'monospace';
+const PROG_COLOR = '#60a5fa';   // PROG mode highlight (blue)
+const MONO = 'monospace';
 
 // ─── Styles ──────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
@@ -1198,8 +1278,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#5a7890',
   },
   infoChipActive: { backgroundColor: '#1a4060', borderColor: '#7ab8e8', color: '#c8e8ff' },
-  infoChipRun:    { backgroundColor: '#1a4020', borderColor: '#3a8040', color: '#c8ffc8' },
-  infoChipProg:   { backgroundColor: '#1a2a5a', borderColor: PROG_COLOR, color: '#a0c8ff' },
+  infoChipRun: { backgroundColor: '#1a4020', borderColor: '#3a8040', color: '#c8ffc8' },
+  infoChipProg: { backgroundColor: '#1a2a5a', borderColor: PROG_COLOR, color: '#a0c8ff' },
 
   // ── LCD Outer (bezel / frame) ─────────────────────────────────────────────
   lcdOuter: {
@@ -1328,7 +1408,7 @@ const styles = StyleSheet.create({
     marginTop: 6,
   },
   digitCell: { alignItems: 'center', width: 46 },
-  digitCursor:       { fontSize: 18, fontWeight: '900', height: 22, lineHeight: 22 },
+  digitCursor: { fontSize: 18, fontWeight: '900', height: 22, lineHeight: 22 },
   digitCursorActive: { color: '#0a2a60' },
   digitCursorHidden: { color: 'transparent' },
   digitChar: {
@@ -1644,7 +1724,7 @@ const styles = StyleSheet.create({
   },
   hvBtnDisabled: { opacity: 0.35 },
   hvBtnArrow: { fontSize: 22, color: BTN_TEXT, fontWeight: '900' },
-  hvBtnStep:  { fontSize: 10, color: '#7ab8e8', fontWeight: '700', marginTop: 2 },
+  hvBtnStep: { fontSize: 10, color: '#7ab8e8', fontWeight: '700', marginTop: 2 },
 
   hvDisplay: {
     flex: 1,
@@ -1684,9 +1764,9 @@ const styles = StyleSheet.create({
     borderRadius: 4,
     backgroundColor: BTN_BG,
   },
-  hvStepBtnActive:   { backgroundColor: '#1a3a6a', borderColor: PROG_COLOR },
-  hvStepTxt:         { fontSize: 13, fontWeight: '700', color: '#7ab8e8' },
-  hvStepTxtActive:   { color: PROG_COLOR },
+  hvStepBtnActive: { backgroundColor: '#1a3a6a', borderColor: PROG_COLOR },
+  hvStepTxt: { fontSize: 13, fontWeight: '700', color: '#7ab8e8' },
+  hvStepTxtActive: { color: PROG_COLOR },
 
   // ── Bottom bar ────────────────────────────────────────────────────────────
   bottomBar: {
