@@ -33,13 +33,6 @@
         "android.permission.BLUETOOTH_SCAN",
         "android.permission.BLUETOOTH_ADVERTISE",
         "android.permission.ACCESS_FINE_LOCATION",
-        "android.permission.ACCESS_COARSE_LOCATION",
-        "android.permission.BLUETOOTH",
-        "android.permission.BLUETOOTH_ADMIN",
-        "android.permission.BLUETOOTH_CONNECT",
-        "android.permission.BLUETOOTH_SCAN",
-        "android.permission.BLUETOOTH_ADVERTISE",
-        "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.ACCESS_COARSE_LOCATION"
       ],
       "package": "com.anonymous.gmcountingsystem"
@@ -60,6 +53,11 @@
           "bluetoothAlwaysPermission": "Allow GM Counting System to use Bluetooth for detector connectivity."
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "9d640832-cdb8-4a46-a0fe-62bb9edfdb9c"
+      }
+    }
   }
 }

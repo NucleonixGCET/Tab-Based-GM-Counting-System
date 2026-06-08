@@ -134,14 +134,17 @@ export default function App() {
 function GMCountingScreen() {
   const { hv, setHv } = useContext(GMContext);
   const [hvStep, setHvStep] = useState(30);
-  const refHvRef = useRef(0);
+  const refHvRef = useRef(0);          // kept for backward compat (sim mode)
+  const hvHistoryRef = useRef([]);      // rolling buffer of last 4 BLE HV readings
 
+  // Simulation fallback: jitter refHv when not BLE-connected
   useEffect(() => {
     const iv = setInterval(() => {
       refHvRef.current = Math.max(0, hv + Math.floor((Math.random() - 0.5) * 6));
     }, 1000);
     return () => clearInterval(iv);
   }, [hv]);
+
 
   const [bootStage, setBootStage] = useState(BOOT_GEIGER);
   const [storeDataMode, setStoreDataMode] = useState(STORE_MODE_AUTO);
@@ -190,6 +193,12 @@ function GMCountingScreen() {
   // Frozen final results shown after execution ends
   const [finalResult, setFinalResult] = useState(null);  // null = no run yet
   const [finalHV, setFinalHV] = useState(null);          // HV snapshot at stop
+  // Snapshot shown during the 3-second gap between iterations
+  const [iterGapSnapshot, setIterGapSnapshot] = useState(null); // { count, hv } | null
+  // HV driven from inside the 1-second tick so it updates in the same render batch as count
+  const [tickLiveHV, setTickLiveHV] = useState(null);
+  // Warm-up-aware HV display: current value for first 4 secs, rolling avg after.
+  const [avgHV, setAvgHV] = useState(null);
   const [presetTime, setPresetTime] = useState(DEFAULT_PR_TIME);
   const [isRunning, setIsRunning] = useState(false);
   const [elapsedTime, setElapsedTime] = useState(0);
@@ -204,6 +213,7 @@ function GMCountingScreen() {
   const cpmHistoryRef = useRef([]);
   const displayedCountsRef = useRef(0);
   const elapsedTimeRef = useRef(0);
+  const countsRef = useRef(0);
   const bleIsConnectedRef = useRef(false);
   const isRunningRef = useRef(false);
   const acqModeRef = useRef('PRESET_TIME');  // tracks acqMode for use inside BLE callback
@@ -212,29 +222,120 @@ function GMCountingScreen() {
 
   const { countCallbackRef, ble } = useContext(GMContext);
 
+  const lastKnownCpsRef = useRef(0);
+  const rawBleCpsRef = useRef(0);      // raw per-second count from BLE (never overwritten by CPM calc)
+  const preloadActiveRef = useRef(false); // true when SRTC! was sent during SET_HV preload
+
   useEffect(() => { bleIsConnectedRef.current = ble.isConnected; }, [ble.isConnected]);
   useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
   useEffect(() => { acqModeRef.current = acqMode; }, [acqMode]);
   useEffect(() => { liveHVRef.current = ble.liveHV; }, [ble.liveHV]);
 
+  // ── Display queue → live display & BLE timing (1 frame per second) ──────
+  // We listen to ble.liveCountToken which is guaranteed to increment on every
+  // frame popped from the display queue in useBleDetector (1 frame/sec).
+  // In BLE mode, all time progression, display counts, database entries, and
+  // end-of-run iterations are driven by this steady 1-second cadence.
+  useEffect(() => {
+    if (!ble.isConnected || !isRunningRef.current) return;
+    if (ble.liveCount == null) return;
+
+    // Always update the raw per-second ref (used by CPS/CPM history)
+    rawBleCpsRef.current = ble.liveCount;
+
+    // Advance elapsed time for each popped frame
+    elapsedTimeRef.current += 1;
+    const nextTime = elapsedTimeRef.current;
+    setElapsedTime(nextTime);
+
+    if (acqModeRef.current === 'PRESET_TIME') {
+      // PRESET_TIME: smoothly accumulate each drained frame count for display and countsRef
+      countsRef.current += ble.liveCount;
+      displayedCountsRef.current = countsRef.current;
+      setDisplayedCounts(countsRef.current);
+      setCounts(countsRef.current);
+
+      if (nextTime >= presetTime) {
+        if (intervalRef.current) clearInterval(intervalRef.current);
+        
+        ble.sendCommand('STPC!').then((ok) => {
+          if (!ok) console.warn('[BLE] STPC command failed');
+          else console.log('[BLE] STPC sent on iteration completion');
+        });
+
+        // Finalize immediately since countsRef.current is already fully accumulated
+        finalizeIteration(countsRef.current);
+      }
+    } else if (acqModeRef.current === 'CPS') {
+      // CPS: show the raw per-second value directly
+      displayedCountsRef.current = ble.liveCount;
+      setDisplayedCounts(ble.liveCount);
+      setCounts(ble.liveCount);
+
+      // Record CPS reading
+      iterationResultsRef.current.push({
+        timeUnit: nextTime,
+        count: ble.liveCount,
+        refHv: avgRefHv()
+      });
+    } else if (acqModeRef.current === 'CPM') {
+      // CPM: push raw CPS to history
+      cpmHistoryRef.current.push(ble.liveCount);
+
+      // Compute CPM every 5 seconds
+      if (cpmHistoryRef.current.length % 5 === 0) {
+        const last5 = cpmHistoryRef.current.slice(-5);
+        const avg = last5.reduce((a, b) => a + b, 0) / last5.length;
+        const cpm = Math.round(avg * 60);
+        displayedCountsRef.current = cpm;
+        setDisplayedCounts(cpm);
+        iterationResultsRef.current.push({
+          timeUnit: nextTime,
+          count: cpm,
+          refHv: avgRefHv()
+        });
+      }
+    }
+  }, [ble.liveCountToken, ble.isConnected, presetTime]);
+
+
+  // ── BLE HV history: rolling average of last 4 readings ──────────────────
+  // First 4 seconds: show the current received HV (no lag from averaging).
+  // Once 4 values are in the buffer: switch to the rolling 4-value average.
+  useEffect(() => {
+    if (ble.liveHV == null) return;
+    const newBuf = [...hvHistoryRef.current, ble.liveHV].slice(-4);
+    hvHistoryRef.current = newBuf;
+    if (newBuf.length < 4) {
+      // Warm-up: fewer than 4 samples — show current value immediately
+      setAvgHV(ble.liveHV);
+    } else {
+      // Steady state: rolling average of last 4 readings
+      setAvgHV(Math.round(newBuf.reduce((a, b) => a + b, 0) / newBuf.length));
+    }
+  }, [ble.liveHV]);
+
+  // Returns the reference HV for storage:
+  //   - First 4 BLE readings: returns the most recent value (no averaging lag)
+  //   - After 4 readings: returns the rolling 4-value average
+  //   - Not connected: falls back to simulated refHvRef
+  const avgRefHv = () => {
+    const buf = hvHistoryRef.current;
+    if (!bleIsConnectedRef.current) return refHvRef.current;
+    if (buf.length === 0) return ble.liveHV ?? hv;
+    if (buf.length < 4) return buf[buf.length - 1];   // warm-up: current value
+    return Math.round(buf.reduce((a, b) => a + b, 0) / buf.length); // steady: avg
+  };
+
+
   useEffect(() => {
     countCallbackRef.current = (count) => {
       if (!isRunningRef.current) return;
       bleCpsRef.current = count;            // always track latest raw BLE CPS
-      displayedCountsRef.current = count;
-      setCounts(count);
-      // In CPM mode the 5-second window logic controls displayedCounts;
-      // don't overwrite it here or the CPM result would be replaced every second.
-      if (acqModeRef.current !== 'CPM') {
-        setDisplayedCounts(count);
-      }
-      // NOTE: setCounts is intentionally NOT called here.
-      // For PRESET_TIME, the counting interval accumulates counts via bleCpsRef;
-      // calling setCounts(count) here would replace the accumulated total with
-      // the raw CPS reading, making PRESET_TIME display look like CPS.
     };
     return () => { countCallbackRef.current = null; };
   }, []);
+
 
   // ── Database ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -321,6 +422,11 @@ function GMCountingScreen() {
       setDraftIterations(snap.iterations);
       setDraftDHv(snap.dHv);
     }
+    // If we pre-started the detector during SET_HV, stop it now
+    if (preloadActiveRef.current && ble.isConnected) {
+      ble.sendCommand('STPC!').then(() => ble.clearQueue());
+      preloadActiveRef.current = false;
+    }
     setCursorPos(0);
     setActiveParamField(PARAM_FIELD_TIMER);
     programSessionRef.current = null;
@@ -393,91 +499,160 @@ function GMCountingScreen() {
     }
   };
 
-  // ── Counting loop ────────────────────────────────────────────────────────
+  // Helper to finalize iteration/run.
+  // countsRef.current holds the accumulated total in both BLE and sim modes.
+  const finalizeIteration = (overrideCount) => {
+    const iterationCount = typeof overrideCount === 'number' ? overrideCount : countsRef.current;
+    iterationResultsRef.current.push({ count: iterationCount, refHv: avgRefHv() });
+
+    // ── Save this iteration as its own separate DB entry immediately ──
+    const iterMeasurement = {
+      value: iterationCount,
+      acqMode,
+      presetTime,
+      numberOfReadings: storedReadings.length,
+      iterations: 1,          // each row represents a single iteration
+      dHv,
+      iterationResults: [{ count: iterationCount, refHv: avgRefHv() }],
+      hv,
+      storeDataMode,
+      outputRoute,
+      detectorInput: rearPanelConfigRef.current.detectorInput,
+      powerInput: rearPanelConfigRef.current.powerInput,
+    };
+    if (storeDataMode === STORE_MODE_AUTO) {
+      appendStoredMeasurement(iterMeasurement);
+    } else {
+      setPendingMeasurement(iterMeasurement); // overwrite pending; user stores manually
+    }
+
+    const done = iterationResultsRef.current.length;
+    if (done < iterations) {
+      // ── Freeze the display for the 3-second gap ──────────────────────
+      const gapHv = liveHVRef.current ?? hv;
+      setIterGapSnapshot({ count: iterationCount, hv: gapHv });
+
+      // Prepare counters for next iteration (display stays frozen via snapshot)
+      elapsedTimeRef.current = 0;
+      setElapsedTime(0);
+      setCurrentIteration(done + 1);
+      countsRef.current = 0;
+      setCounts(0);
+      setDisplayedCounts(0);
+      displayedCountsRef.current = 0;
+      hvHistoryRef.current = [];
+      setAvgHV(null);
+      
+      if (dHv > 0) {
+        setHv((prevHv) => {
+          const nextHv = Math.min(prevHv + dHv, HV_MAX);
+          if (bleIsConnectedRef.current) {
+            const cmd = `STHV ${nextHv}!`;
+            ble.sendCommand(cmd).then((ok) => {
+              if (ok) console.log(`[BLE] Iteration HV set to: ${nextHv}V`);
+              else console.warn('[BLE] Iteration HV command failed');
+            });
+          }
+          return nextHv;
+        });
+      }
+
+      // Clear queue for the next run
+      ble.clearQueue();
+
+      if (bleIsConnectedRef.current) {
+        // Wait 3 seconds (gap between iterations), then send SRTC
+        setTimeout(() => {
+          setIterGapSnapshot(null); // clear freeze — new iteration begins
+          ble.sendCommand('SRTC!').then((ok) => {
+            if (ok) console.log('[BLE] SRTC sent for iteration', done + 1);
+            else console.warn('[BLE] SRTC iteration command failed');
+            setIterationRestartToken((v) => v + 1);
+          });
+        }, 3000);
+      } else {
+        // Simulated mode: 3-second gap before next iteration
+        setTimeout(() => {
+          setIterGapSnapshot(null); // clear freeze — new iteration begins
+          setIterationRestartToken((v) => v + 1);
+        }, 3000);
+      }
+    } else {
+      // All iterations finished — freeze display on the last iteration's count (not grand total)
+      displayedCountsRef.current = iterationCount;
+      setDisplayedCounts(iterationCount);
+      setFinalResult(iterationCount);   // show last iteration's count, consistent with per-gap display
+      setFinalHV(liveHVRef.current ?? hv);
+      setCurrentIteration(0);
+      setIsRunning(false);
+      // Each iteration was already saved individually above; no extra DB write needed
+    }
+  };
+
+  // ── Counting loop (Handles simulation ticks or flushes BLE frames) ────────
   useEffect(() => {
     if (!isRunning) return;
+
     intervalRef.current = setInterval(() => {
-      const tick = bleIsConnectedRef.current ? 0 : Math.floor(COUNT_RATE + (Math.random() - 0.5) * 40);
-
-      if (acqMode === 'PRESET_TIME') {
-        // BLE: accumulate the latest BLE CPS reading each second (bleCpsRef is kept
-        // up to date by the data callback without touching counts state).
-        // Simulation: add random tick each second.
-        const ptTick = bleIsConnectedRef.current ? bleCpsRef.current : tick;
-        setCounts((c) => c + ptTick);
-        setRunningTotal((r) => r + ptTick);  // dedicated cumulative display state
-        setElapsedTime((prev) => {
-          const next = prev + 1;
-          if (next >= presetTime) {
-            clearInterval(intervalRef.current);
-            setCounts((finalCount) => {
-              iterationResultsRef.current.push({ count: finalCount, refHv: refHvRef.current });
-              const done = iterationResultsRef.current.length;
-              if (done < iterations) {
-                setTimeout(() => {
-                  elapsedTimeRef.current = 0;
-                  setElapsedTime(0);
-                  setCurrentIteration(done + 1);
-                  if (dHv > 0) setHv((v) => Math.min(v + dHv, HV_MAX));
-                  setIterationRestartToken((v) => v + 1);
-                }, 1000);
-                return 0;   // reset immediately so runningSum shows correct cumulative during pause
-              } else {
-                const iters = iterationResultsRef.current;
-                const total = iters.reduce((a, b) => a + b.count, 0);
-                displayedCountsRef.current = total;
-                setDisplayedCounts(total);
-                setFinalResult(total);          // PRESET_TIME: show total counts directly
-                setFinalHV(liveHVRef.current ?? hv);
-                setCurrentIteration(0);
-                setIsRunning(false);
-                queueMeasurement(total);
-                return finalCount;
-              }
-            });
-            return prev;
-          }
-          return next;
-        });
-
-      } else if (acqMode === 'CPS') {
-        if (bleIsConnectedRef.current) {
-          iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: displayedCountsRef.current, refHv: refHvRef.current });
-          elapsedTimeRef.current += 1;
-          setElapsedTime((t) => t + 1);
-        } else {
-          windowCountsRef.current += tick;
-          const cps = windowCountsRef.current;
-          displayedCountsRef.current = cps;
-          setDisplayedCounts(cps);
-          iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cps, refHv: refHvRef.current });
-          windowCountsRef.current = 0;
-          elapsedTimeRef.current += 1;
-          setElapsedTime((t) => t + 1);
+      if (bleIsConnectedRef.current) {
+        // BLE mode: timing/display/stop are fully driven by the ble.liveCountToken useEffect.
+        // The interval timer here only runs as a background task to flush the frame queue
+        // (to keep it clean) and update liveHVRef.current for end-of-run snapshotting.
+        const frames = ble.flushFrames();
+        for (const f of frames) {
+          if (f.hv != null) liveHVRef.current = f.hv;
         }
+      } else {
+        // Simulated mode: local ticker
+        const simTick = Math.floor(COUNT_RATE + (Math.random() - 0.5) * 40);
 
-      } else if (acqMode === 'CPM') {
-        elapsedTimeRef.current += 1;
-        setElapsedTime((t) => t + 1);
+        if (acqMode === 'PRESET_TIME') {
+          countsRef.current += simTick;
+          setCounts(countsRef.current);
+          displayedCountsRef.current = countsRef.current;
+          setDisplayedCounts(countsRef.current);
+          setRunningTotal((r) => r + simTick);
 
-        const currentCps = bleIsConnectedRef.current ? bleCpsRef.current : tick;
-        cpmHistoryRef.current.push(currentCps);
+          elapsedTimeRef.current += 1;
+          const nextTime = elapsedTimeRef.current;
+          setElapsedTime(nextTime);
 
-        // 5 second sliding window, updating every 2 seconds
-        if (cpmHistoryRef.current.length >= 5) {
-          if ((cpmHistoryRef.current.length - 5) % 2 === 0) {
+          if (nextTime >= presetTime) {
+            clearInterval(intervalRef.current);
+            finalizeIteration(countsRef.current);
+          }
+        } else if (acqMode === 'CPS') {
+          displayedCountsRef.current = simTick;
+          setDisplayedCounts(simTick);
+          setCounts(simTick);
+          lastKnownCpsRef.current = simTick;
+          
+          elapsedTimeRef.current += 1;
+          const nextTime = elapsedTimeRef.current;
+          setElapsedTime(nextTime);
+          iterationResultsRef.current.push({ timeUnit: nextTime, count: simTick, refHv: avgRefHv() });
+        } else if (acqMode === 'CPM') {
+          lastKnownCpsRef.current = simTick;
+          cpmHistoryRef.current.push(simTick);
+          
+          elapsedTimeRef.current += 1;
+          const nextTime = elapsedTimeRef.current;
+          setElapsedTime(nextTime);
+
+          if (cpmHistoryRef.current.length % 5 === 0) {
             const last5 = cpmHistoryRef.current.slice(-5);
-            const sum = last5.reduce((a, b) => a + b, 0);
-            const cpm = sum * 12;
+            const avg = last5.reduce((a, b) => a + b, 0) / last5.length;
+            const cpm = Math.round(avg * 60);
             displayedCountsRef.current = cpm;
             setDisplayedCounts(cpm);
-            iterationResultsRef.current.push({ timeUnit: iterationResultsRef.current.length + 1, count: cpm, refHv: refHvRef.current });
+            iterationResultsRef.current.push({ timeUnit: nextTime, count: cpm, refHv: avgRefHv() });
           }
         }
       }
     }, 1000);
+
     return () => clearInterval(intervalRef.current);
-  }, [isRunning, acqMode, presetTime, iterations, iterationRestartToken, hv, storeDataMode, outputRoute]);
+  }, [isRunning, acqMode, presetTime, iterations, iterationRestartToken, hv, storeDataMode, outputRoute, ble.isConnected]);
 
   // ── PROG ─────────────────────────────────────────────────────────────────
   const handlePROG = () => {
@@ -501,12 +676,26 @@ function GMCountingScreen() {
     if (progSub === PROG_SET_HV) {
       const newHv = digitsToNum(draftHvDigits);
       setHv(newHv);
-      // ── Send HV command to scintillator device ──────────────────────────
+      // ── Send HV command, then immediately start detector so frames queue up ──
       if (ble.isConnected) {
         const cmd = `STHV ${newHv}!`;
         ble.sendCommand(cmd).then((ok) => {
-          if (ok) showFlashMessage(`HV SET: ${newHv}V`);
-          else showFlashMessage('HV CMD FAILED');
+          if (ok) {
+            showFlashMessage(`HV SET: ${newHv}V`);
+            // Pre-start: clear any stale frames, then send SRTC so device streams
+            // data into the queue before the user presses SRT.
+            ble.clearQueue();
+            ble.sendCommand('SRTC!').then((srtOk) => {
+              if (srtOk) {
+                preloadActiveRef.current = true;
+                console.log('[BLE] SRTC sent during SET_HV preload');
+              } else {
+                console.warn('[BLE] SRTC preload failed');
+              }
+            });
+          } else {
+            showFlashMessage('HV CMD FAILED');
+          }
         });
       }
       if (draftAcqMode === 'CPS' || draftAcqMode === 'CPM') setProgSub(PROG_DATA_STORE);
@@ -605,52 +794,71 @@ function GMCountingScreen() {
       Alert.alert('Rear Panel Check', 'Connect +12V adaptor power and the G.M. detector on the MHV socket.');
       return;
     }
-    setCounts(0); displayedCountsRef.current = 0; setDisplayedCounts(0);
-    setFinalResult(null); setFinalHV(null);
+    setCounts(0); countsRef.current = 0; displayedCountsRef.current = 0; setDisplayedCounts(0);
+    setFinalResult(null); setFinalHV(null); setIterGapSnapshot(null);
     elapsedTimeRef.current = 0; setElapsedTime(0); setRunningTotal(0);
     windowCountsRef.current = 0; windowElapsedRef.current = 0; cpmHistoryRef.current = [];
     iterationResultsRef.current = [];
+    lastKnownCpsRef.current = 0; rawBleCpsRef.current = 0;
+    hvHistoryRef.current = [];
+    setAvgHV(null);
     setCurrentIteration(iterations > 1 ? 1 : 0);
     programSessionRef.current = null;
     setProgSub(PROG_OFF);
     setIsRunning(true);
-    // ── Send START command to detector ──────────────────────────────────────
+    // ── Send START command to detector (skip if preload already started) ──────
     if (ble.isConnected) {
-      ble.sendCommand('SRTC!').then((ok) => {
-        if (!ok) console.warn('[BLE] SRTC command failed');
-        else console.log('[BLE] SRTC sent');
-      });
+      if (preloadActiveRef.current) {
+        // Device is already streaming; just let the queue drain normally.
+        preloadActiveRef.current = false;
+        console.log('[BLE] SRT: preload was active, queue already filling — no extra SRTC sent');
+      } else {
+        ble.clearQueue();
+        ble.sendCommand('SRTC!').then((ok) => {
+          if (!ok) console.warn('[BLE] SRTC command failed');
+          else console.log('[BLE] SRTC sent');
+        });
+      }
+    } else {
+      // Simulated mode: always clear queue
+      ble.clearQueue();
+      preloadActiveRef.current = false;
     }
   };
 
   const handleSTP = () => {
+    if (!isRunning) return;
     clearInterval(intervalRef.current);
     // ── Compute frozen final values BEFORE setIsRunning(false) ──────────────
     // (isRunningRef is still true here, so BLE callbacks are still gated)
     const hvSnapshot = liveHVRef.current ?? hv;
     setFinalHV(hvSnapshot);
 
+    if (bleIsConnectedRef.current) {
+      ble.clearQueue();
+    }
+
     if (acqMode === 'CPS') {
-      // Sum of all per-second counts = total counts over the run
-      const totalCounts = iterationResultsRef.current.reduce((a, b) => a + (b.count ?? 0), 0);
-      setFinalResult(totalCounts);
-      queueMeasurement(totalCounts);
+      // Last recorded per-second count (raw CPS value, no summation)
+      const lastCount = iterationResultsRef.current.length > 0
+        ? iterationResultsRef.current[iterationResultsRef.current.length - 1].count ?? 0
+        : displayedCountsRef.current;
+      setFinalResult(lastCount);
+      queueMeasurement(lastCount);
     } else if (acqMode === 'CPM') {
-      // Last 5-second window × 12 = CPM  (same algorithm used during run)
       const last5 = cpmHistoryRef.current.slice(-5);
-      const cpmFinal = last5.length > 0
-        ? Math.round(last5.reduce((a, b) => a + b, 0) * 12)
-        : 0;
+      const avg = last5.length > 0 ? last5.reduce((a, b) => a + b, 0) / last5.length : 0;
+      const cpmFinal = Math.round(avg * 60);
       setFinalResult(cpmFinal);
       queueMeasurement(cpmFinal);
     } else if (acqMode === 'PRESET_TIME') {
-      // Direct total count (early manual stop)
-      const iters = iterationResultsRef.current;
-      const total = iters.length > 0
-        ? iters.reduce((a, b) => a + b.count, 0)
-        : 0;
-      setFinalResult(total);
-      queueMeasurement(total);
+      // Early manual stop — show the current iteration's partial count only
+      const partialCount = countsRef.current;
+      setFinalResult(partialCount);
+      // Save the partial current iteration if it has any elapsed time
+      if (elapsedTimeRef.current > 0) {
+        queueMeasurement(partialCount);
+      }
     }
 
     setIsRunning(false);
@@ -715,19 +923,19 @@ function GMCountingScreen() {
     ? Math.max(presetTime - elapsedTime, 0)
     : acqMode === 'CPM' ? Math.max(60 - windowElapsedRef.current, 0) : 0;
 
-  // displayResult: applies the same aggregation formula live AND frozen after stop.
-  //   PRESET_TIME → running average of iteration counts
-  //   CPS         → running sum of all per-second counts
+  // displayResult: applies the correct formula for each mode, live and after stop.
+  //   PRESET_TIME → running cumulative total (sum across all ticks)
+  //   CPS         → latest raw per-second reading (no summation)
   //   CPM         → last 5-second window × 12  (displayedCounts already holds this)
-  const _completedIterSum = iterationResultsRef.current.reduce((a, b) => a + (b.count ?? 0), 0);
   const _liveDisplay = acqMode === 'PRESET_TIME'
-    ? runningTotal          // PRESET_TIME: direct cumulative count
+    ? counts                // PRESET_TIME: show current iteration's count
     : acqMode === 'CPS'
-      ? _completedIterSum   // running sum of per-second readings
+      ? displayedCounts     // CPS: raw current per-second value (no accumulation)
       : displayedCounts;    // CPM: 5-sec window × 12, already computed in interval
 
+  // During the 3-second inter-iteration gap: freeze display to the just-finished iteration
   const displayResult = isRunning
-    ? _liveDisplay
+    ? (iterGapSnapshot !== null ? iterGapSnapshot.count : _liveDisplay)
     : (finalResult !== null ? finalResult : counts);  // fallback before first run
 
   const isBooting = bootStage !== BOOT_READY;
@@ -743,9 +951,15 @@ function GMCountingScreen() {
   const formatPRTime = (n) => String(n).padStart(4, '0');
   const formatHV4 = (n) => typeof n === 'number' ? String(n).padStart(4, '0') : '----';
 
-  // HV display: live when running, frozen at stop time, falls back to set HV
+  // HV display: frozen during gap, live when running, frozen at stop.
+  // While running with BLE: use avgHV (current value for first 4 secs, then
+  // rolling 4-value average) to eliminate the initial-second lag.
   const displayHV = isRunning
-    ? (ble.isConnected && ble.liveHV != null ? ble.liveHV : hv)
+    ? (iterGapSnapshot !== null
+        ? iterGapSnapshot.hv                              // gap: frozen HV from completed iteration
+        : (ble.isConnected
+            ? (avgHV ?? ble.liveHV ?? hv)                // BLE: warm-up aware average
+            : (tickLiveHV ?? hv)))                        // sim: tick-driven HV
     : (finalHV !== null ? finalHV : hv);
 
   // Recall computed values
@@ -982,7 +1196,7 @@ function GMCountingScreen() {
                   </View>
                   <View style={{ flexDirection: "row", justifyContent: "center", flex: 1 }}>
                     {draftHvDigits.map((d, i) => (
-                      <View key={`hvcol-${i}`} style={{ alignItems: "center", width: 30 }}>
+                      <View key={`hvcol-${i}`} style={{ alignItems: "center", width: 20, marginHorizontal: 1 }}>
                         <Text style={{ fontSize: 22, fontWeight: "900", color: "#0a2a6a", fontFamily: MONO, lineHeight: 24 }}>
                           {i === hvCursorPos ? "^" : " "}
                         </Text>
@@ -1073,14 +1287,14 @@ function GMCountingScreen() {
               <View style={styles.lcdOverlay}>
                 <View style={{ flexDirection: 'row', alignItems: 'center', width: '100%', paddingHorizontal: 14 }}>
                   {/* Left label */}
-                  <View style={{ width: 80 }}>
-                    <Text style={[styles.lcdPhysLeft, { fontSize: 20, lineHeight: 24 }]}>PRESET</Text>
-                    <Text style={[styles.lcdPhysLeft, { fontSize: 20, lineHeight: 24 }]}>TIME</Text>
+                  <View style={{ width: 100 }}>
+                    <Text style={[styles.lcdPhysLeft, { fontSize: 20, lineHeight: 24, flex: 0 }]} numberOfLines={1}>PRESET</Text>
+                    <Text style={[styles.lcdPhysLeft, { fontSize: 20, lineHeight: 24, flex: 0 }]} numberOfLines={1}>TIME</Text>
                   </View>
                   {/* Digit columns — cursor ^ sits directly above its digit in same View */}
                   <View style={{ flex: 1, flexDirection: 'row', justifyContent: 'center' }}>
                     {draftDigits.map((d, i) => (
-                      <View key={`dcol-${i}`} style={{ alignItems: 'center', width: 30, marginHorizontal: 2 }}>
+                      <View key={`dcol-${i}`} style={{ alignItems: 'center', width: 20, marginHorizontal: 1 }}>
                         {i === cursorPos
                           ? <Text style={{ fontSize: 16, fontWeight: '900', fontFamily: MONO, lineHeight: 18, color: '#0a2a6a' }}>^</Text>
                           : <View style={{ height: 18 }} />}
@@ -1123,7 +1337,7 @@ function GMCountingScreen() {
                   ) : (
                     <Text style={styles.lcdLine} numberOfLines={1}>
                       {isRunning
-                        ? `   ET${formatPRTime(Math.min(elapsedTime + 1, presetTime))}       PT${formatPRTime(presetTime)}${blinkOn ? ' A' : '  '}`
+                        ? `   ET${formatPRTime(elapsedTime)}       PT${formatPRTime(presetTime)}${blinkOn ? ' A' : '  '}`
                         : `   SN${snStr}       PT${ptStr}`}
                     </Text>
                   )}
