@@ -136,9 +136,13 @@ function parseFrame(rawText) {
   // Primary format: Counts,N,CurHV,F!
   const newFmt = rawText.matchAll(/Counts,(\d+),CurHV,([\d.]+)!/g);
   for (const m of newFmt) {
+    const hvRaw = parseFloat(m[2]);
+    // The device alternately sends HV as kV (e.g. "0.397") or already in Volts
+    // (e.g. "397"). Values >= 10 are already in Volts; values < 10 are in kV.
+    const hvVolts = hvRaw >= 10 ? Math.round(hvRaw) : Math.round(hvRaw * 1000);
     results.push({
       count: parseInt(m[1], 10),
-      hv: Math.round(parseFloat(m[2]) * 1000),  // kV → V
+      hv: hvVolts,
     });
   }
 
@@ -244,6 +248,18 @@ export function useBleDetector({ onCountReceived } = {}) {
   function _startDisplayDrain() {
     // Only one drain timer at a time
     if (displayDrainRef.current) return;
+
+    // Dispatch the first frame immediately (0 ms delay) so a 1-frame-per-second
+    // stream from the device is shown in real time instead of 1 second late.
+    const firstFrame = displayQueueRef.current.shift();
+    if (firstFrame) {
+      dispatch({ type: 'LIVE_COUNT', payload: firstFrame });
+    }
+
+    // If the queue is already empty after the first frame, no interval needed.
+    if (displayQueueRef.current.length === 0) return;
+
+    // For any additional queued frames, release one per second.
     displayDrainRef.current = setInterval(() => {
       const frame = displayQueueRef.current.shift();
       if (frame) {

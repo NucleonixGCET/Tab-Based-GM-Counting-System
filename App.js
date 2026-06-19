@@ -1,6 +1,6 @@
 /**
  * GM Counting System — App.js
- * Visual design matches the NUCLEONIX GC-602A physical instrument.
+ * Visual design matches the NUCLEONIX GCS602T physical instrument.
  *
  * ACQ Modes  : PRESET_TIME (default) | CPS | CPM
  * PROG Cycle : OFF → ACQ_SELECT → TIME_ADJUST → READINGS_ADJUST
@@ -33,6 +33,7 @@ import {
 import * as SQLite from 'expo-sqlite';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
+import XLSX from 'xlsx';
 import { useBleDetector } from './hooks/useBleDetector';
 
 // Suppress known React Native internal touch-tracking warning (harmless,
@@ -729,7 +730,7 @@ function GMCountingScreen() {
   const handleUp = () => {
     if (isRunning || bootStage !== BOOT_READY || flashMessage) return;
     if (progSub === PROG_DATA_STORE) { setStoreDataMode((m) => m === STORE_MODE_AUTO ? STORE_MODE_MANUAL : STORE_MODE_AUTO); return; }
-    if (progSub === PROG_DATA_OUTPUT) { handleExportDB(); return; }   // ▲ = confirm export
+    if (progSub === PROG_DATA_OUTPUT) { exportIterationsToExcel(); return; }   // ▲ = export iterations to Excel
     if (progSub === PROG_DATA_RECALL) {
       if (storedReadings.length === 0) return;
       const _entry = storedReadings[recallIndex >= 0 ? recallIndex : 0];
@@ -916,6 +917,104 @@ function GMCountingScreen() {
         Alert.alert('Export Error', 'Sharing not available.');
       }
     } catch (err) { Alert.alert('Export Failed', err.message); }
+  };
+
+  // ── Export iteration results to Excel (.xlsx) ─────────────────────────────
+  // Each row = one iteration from any stored measurement.
+  // Columns: S.No | Iteration | Count | HV (V) | Preset Time (s) | ACQ Mode | Timestamp
+  const exportIterationsToExcel = async () => {
+    try {
+      if (storedReadings.length === 0) {
+        Alert.alert('No Data', 'There are no stored measurements to export.');
+        return;
+      }
+
+      // Build flat row list
+      const rows = [];
+      for (const m of storedReadings) {
+        const results = m.iterationResults || [];
+        if (results.length === 0) {
+          // Measurement stored without per-iteration breakdown — treat top-level value as one row
+          rows.push({
+            'S.No': m.serialNo ?? '',
+            'Iteration': 1,
+            'Count': m.value ?? '',
+            'HV (V)': m.hv ?? '',
+            'Preset Time (s)': m.presetTime ?? '',
+            'ACQ Mode': m.acqMode ?? '',
+            'Timestamp': m.timestamp ?? '',
+          });
+        } else {
+          results.forEach((r, idx) => {
+            rows.push({
+              'S.No': m.serialNo ?? '',
+              'Iteration': idx + 1,
+              'Count': r.count ?? '',
+              'HV (V)': r.refHv ?? m.hv ?? '',
+              'Preset Time (s)': m.presetTime ?? '',
+              'ACQ Mode': m.acqMode ?? '',
+              'Timestamp': m.timestamp ?? '',
+            });
+          });
+        }
+      }
+
+      // Build workbook
+      const ws = XLSX.utils.json_to_sheet(rows);
+
+      // Auto-fit column widths (approximate — based on header and sample data)
+      const colWidths = [
+        { wch: 6 },   // S.No
+        { wch: 10 },  // Iteration
+        { wch: 10 },  // Count
+        { wch: 8 },   // HV (V)
+        { wch: 16 },  // Preset Time
+        { wch: 14 },  // ACQ Mode
+        { wch: 22 },  // Timestamp
+      ];
+      ws['!cols'] = colWidths;
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Iteration Results');
+
+      // Write as base64 string (works in React Native)
+      const b64 = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
+
+      const fileName = `NP_Iterations_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.xlsx`;
+      const localUri = `${FileSystem.cacheDirectory}${fileName}`;
+      await FileSystem.writeAsStringAsync(localUri, b64, { encoding: FileSystem.EncodingType.Base64 });
+
+      // On Android: try to save to Downloads via SAF; fall back to Share sheet
+      if (Platform.OS === 'android') {
+        const perm = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(
+          'content://com.android.externalstorage.documents/tree/primary%3ADownload'
+        );
+        if (perm.granted && perm.directoryUri) {
+          const tgt = await FileSystem.StorageAccessFramework.createFileAsync(
+            perm.directoryUri,
+            fileName,
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+          );
+          await FileSystem.writeAsStringAsync(tgt, b64, { encoding: FileSystem.EncodingType.Base64 });
+          Alert.alert('Export Complete', `Saved to Downloads:\n${fileName}`);
+          return;
+        }
+      }
+
+      // iOS or SAF declined: use the system share sheet
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(localUri, {
+          mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          dialogTitle: 'Export Iteration Results',
+          UTI: 'com.microsoft.excel.xlsx',
+        });
+      } else {
+        Alert.alert('Export Error', 'Sharing is not available on this device.');
+      }
+    } catch (err) {
+      Alert.alert('Export Failed', err.message);
+      console.error('[Excel] Export error:', err);
+    }
   };
 
   // ── Derived values ────────────────────────────────────────────────────────
@@ -1408,7 +1507,7 @@ function GMCountingScreen() {
             resizeMode="contain"
           />
           <Text style={styles.hintText}>NUCLEONIX</Text>
-          <Text style={styles.modelText}>GC 602A</Text>
+          <Text style={styles.modelText}>GCS602T</Text>
         </View>
 
       </View>
@@ -1547,7 +1646,7 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
 
-  // ── Physical 2-line LCD row layout (matches GC-602A display exactly) ────
+  // ── Physical 2-line LCD row layout (matches GCS602T display exactly) ────
   // Line 1: LABEL (left)          HV (right)
   // Line 2: VALUE (left)        XXXX (right)
   lcdPhysRow: {
