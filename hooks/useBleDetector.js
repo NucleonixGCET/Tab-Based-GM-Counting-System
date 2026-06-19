@@ -254,6 +254,8 @@ export function useBleDetector({ onCountReceived } = {}) {
     const firstFrame = displayQueueRef.current.shift();
     if (firstFrame) {
       dispatch({ type: 'LIVE_COUNT', payload: firstFrame });
+      // Fire callback NOW for first frame so it's counted in real time
+      onCountReceived?.(firstFrame.count);
     }
 
     // If the queue is already empty after the first frame, no interval needed.
@@ -264,6 +266,8 @@ export function useBleDetector({ onCountReceived } = {}) {
       const frame = displayQueueRef.current.shift();
       if (frame) {
         dispatch({ type: 'LIVE_COUNT', payload: frame });
+        // Fire callback synchronized with frame display (1 per second)
+        onCountReceived?.(frame.count);
       }
       // Auto-stop the timer when the queue drains
       if (displayQueueRef.current.length === 0) {
@@ -383,8 +387,7 @@ export function useBleDetector({ onCountReceived } = {}) {
             frameQueueRef.current.push(frame);
             // Push to display queue (drained 1 frame/sec for smooth LCD updates)
             displayQueueRef.current.push(frame);
-            // Immediate callback for CPS/CPM modes (unchanged behaviour)
-            onCountReceived?.(frame.count);
+            // Callback will be fired from _startDisplayDrain() when frame is actually displayed
           }
           // Kick off (or continue) the 1-second display drain
           _startDisplayDrain();
