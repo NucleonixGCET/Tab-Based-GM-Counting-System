@@ -21,6 +21,8 @@ import {
   View,
   Text,
   Image,
+  TextInput,
+  Modal,
   TouchableOpacity,
   StyleSheet,
   Alert,
@@ -135,7 +137,7 @@ export default function App() {
 function GMCountingScreen() {
   const { hv, setHv } = useContext(GMContext);
   const [hvStep, setHvStep] = useState(30);
-  const refHvRef = useRef(0);          // kept for backward compat (sim mode)
+  const refHvRef = useRef(0);          // kept for backward compat (sim mode, stored as setHv)
   const hvHistoryRef = useRef([]);      // rolling buffer of last 4 BLE HV readings
 
   // Simulation fallback: jitter refHv when not BLE-connected
@@ -156,6 +158,11 @@ function GMCountingScreen() {
   const [pendingMeasurement, setPendingMeasurement] = useState(null);
   const [flashMessage, setFlashMessage] = useState('');
   const [isBleMenuOpen, setIsBleMenuOpen] = useState(false);
+
+  // ── Export rename modal ───────────────────────────────────────────────────
+  const [exportModalVisible, setExportModalVisible] = useState(false);
+  const [exportFileName, setExportFileName] = useState('');
+  const exportPendingRef = useRef(null);  // holds the pre-built b64 + rows until user confirms name
 
 
   const nextSerialNoRef = useRef(1);
@@ -225,7 +232,8 @@ function GMCountingScreen() {
 
   const lastKnownCpsRef = useRef(0);
   const rawBleCpsRef = useRef(0);      // raw per-second count from BLE (never overwritten by CPM calc)
-  const preloadActiveRef = useRef(false); // true when SRTC! was sent during SET_HV preload
+  // preloadActiveRef removed — preload SRTC is no longer sent; HV warming
+  // only sends STHV and the device stays quiet until startCollecting() / SRTC.
 
   useEffect(() => { bleIsConnectedRef.current = ble.isConnected; }, [ble.isConnected]);
   useEffect(() => { isRunningRef.current = isRunning; }, [isRunning]);
@@ -277,7 +285,7 @@ function GMCountingScreen() {
       iterationResultsRef.current.push({
         timeUnit: nextTime,
         count: ble.liveCount,
-        refHv: avgRefHv()
+        setHv: hv   // store the programmed HV, not the measured average
       });
     } else if (acqModeRef.current === 'CPM') {
       // CPM: push raw CPS to history
@@ -293,7 +301,7 @@ function GMCountingScreen() {
         iterationResultsRef.current.push({
           timeUnit: nextTime,
           count: cpm,
-          refHv: avgRefHv()
+          setHv: hv   // store the programmed HV, not the measured average
         });
       }
     }
@@ -423,11 +431,6 @@ function GMCountingScreen() {
       setDraftIterations(snap.iterations);
       setDraftDHv(snap.dHv);
     }
-    // If we pre-started the detector during SET_HV, stop it now
-    if (preloadActiveRef.current && ble.isConnected) {
-      ble.sendCommand('STPC!').then(() => ble.clearQueue());
-      preloadActiveRef.current = false;
-    }
     setCursorPos(0);
     setActiveParamField(PARAM_FIELD_TIMER);
     programSessionRef.current = null;
@@ -504,7 +507,7 @@ function GMCountingScreen() {
   // countsRef.current holds the accumulated total in both BLE and sim modes.
   const finalizeIteration = (overrideCount) => {
     const iterationCount = typeof overrideCount === 'number' ? overrideCount : countsRef.current;
-    iterationResultsRef.current.push({ count: iterationCount, refHv: avgRefHv() });
+    iterationResultsRef.current.push({ count: iterationCount, setHv: hv });  // store programmed HV
 
     // ── Save this iteration as its own separate DB entry immediately ──
     const iterMeasurement = {
@@ -514,7 +517,7 @@ function GMCountingScreen() {
       numberOfReadings: storedReadings.length,
       iterations: 1,          // each row represents a single iteration
       dHv,
-      iterationResults: [{ count: iterationCount, refHv: avgRefHv() }],
+      iterationResults: [{ count: iterationCount, setHv: hv }],  // programmed HV
       hv,
       storeDataMode,
       outputRoute,
@@ -558,16 +561,22 @@ function GMCountingScreen() {
         });
       }
 
-      // Clear queue for the next run
+      // Stop collecting and clear queue for the inter-iteration gap
+      ble.stopCollecting();
       ble.clearQueue();
 
       if (bleIsConnectedRef.current) {
-        // Wait 3 seconds (gap between iterations), then send SRTC
+        // Wait 3 seconds (gap between iterations), then send SRTC and re-enable
+        // frame collection for the new iteration.
         setTimeout(() => {
           setIterGapSnapshot(null); // clear freeze — new iteration begins
           ble.sendCommand('SRTC!').then((ok) => {
-            if (ok) console.log('[BLE] SRTC sent for iteration', done + 1);
-            else console.warn('[BLE] SRTC iteration command failed');
+            if (ok) {
+              ble.startCollecting();
+              console.log('[BLE] SRTC sent — frame collection started for iteration', done + 1);
+            } else {
+              console.warn('[BLE] SRTC iteration command failed');
+            }
             setIterationRestartToken((v) => v + 1);
           });
         }, 3000);
@@ -631,7 +640,7 @@ function GMCountingScreen() {
           elapsedTimeRef.current += 1;
           const nextTime = elapsedTimeRef.current;
           setElapsedTime(nextTime);
-          iterationResultsRef.current.push({ timeUnit: nextTime, count: simTick, refHv: avgRefHv() });
+          iterationResultsRef.current.push({ timeUnit: nextTime, count: simTick, setHv: hv });  // programmed HV
         } else if (acqMode === 'CPM') {
           lastKnownCpsRef.current = simTick;
           cpmHistoryRef.current.push(simTick);
@@ -646,7 +655,7 @@ function GMCountingScreen() {
             const cpm = Math.round(avg * 60);
             displayedCountsRef.current = cpm;
             setDisplayedCounts(cpm);
-            iterationResultsRef.current.push({ timeUnit: nextTime, count: cpm, refHv: avgRefHv() });
+            iterationResultsRef.current.push({ timeUnit: nextTime, count: cpm, setHv: hv });  // programmed HV
           }
         }
       }
@@ -677,23 +686,15 @@ function GMCountingScreen() {
     if (progSub === PROG_SET_HV) {
       const newHv = digitsToNum(draftHvDigits);
       setHv(newHv);
-      // ── Send HV command, then immediately start detector so frames queue up ──
+      // ── Send STHV only — device warms up HV but stays quiet (no SRTC) ──
+      // Frame collection will begin only when the user presses SRT and
+      // startCollecting() is called, eliminating HV-transition spike frames.
       if (ble.isConnected) {
         const cmd = `STHV ${newHv}!`;
         ble.sendCommand(cmd).then((ok) => {
           if (ok) {
             showFlashMessage(`HV SET: ${newHv}V`);
-            // Pre-start: clear any stale frames, then send SRTC so device streams
-            // data into the queue before the user presses SRT.
-            ble.clearQueue();
-            ble.sendCommand('SRTC!').then((srtOk) => {
-              if (srtOk) {
-                preloadActiveRef.current = true;
-                console.log('[BLE] SRTC sent during SET_HV preload');
-              } else {
-                console.warn('[BLE] SRTC preload failed');
-              }
-            });
+            console.log('[BLE] STHV sent — waiting for SRT before collecting frames');
           } else {
             showFlashMessage('HV CMD FAILED');
           }
@@ -807,23 +808,22 @@ function GMCountingScreen() {
     programSessionRef.current = null;
     setProgSub(PROG_OFF);
     setIsRunning(true);
-    // ── Send START command to detector (skip if preload already started) ──────
+    // ── Send SRTC and enable frame pair-collection ──────────────────────────
+    // Always clear any stale queue/carry first, then send SRTC and immediately
+    // enable the pairing gate so only post-SRTC frames are processed.
     if (ble.isConnected) {
-      if (preloadActiveRef.current) {
-        // Device is already streaming; just let the queue drain normally.
-        preloadActiveRef.current = false;
-        console.log('[BLE] SRT: preload was active, queue already filling — no extra SRTC sent');
-      } else {
-        ble.clearQueue();
-        ble.sendCommand('SRTC!').then((ok) => {
-          if (!ok) console.warn('[BLE] SRTC command failed');
-          else console.log('[BLE] SRTC sent');
-        });
-      }
+      ble.clearQueue();
+      ble.sendCommand('SRTC!').then((ok) => {
+        if (!ok) {
+          console.warn('[BLE] SRTC command failed');
+        } else {
+          ble.startCollecting();
+          console.log('[BLE] SRTC sent — frame collection started');
+        }
+      });
     } else {
       // Simulated mode: always clear queue
       ble.clearQueue();
-      preloadActiveRef.current = false;
     }
   };
 
@@ -836,6 +836,7 @@ function GMCountingScreen() {
     setFinalHV(hvSnapshot);
 
     if (bleIsConnectedRef.current) {
+      ble.stopCollecting();
       ble.clearQueue();
     }
 
@@ -920,67 +921,77 @@ function GMCountingScreen() {
   };
 
   // ── Export iteration results to Excel (.xlsx) ─────────────────────────────
-  // Each row = one iteration from any stored measurement.
-  // Columns: S.No | Iteration | Count | HV (V) | Preset Time (s) | ACQ Mode | Timestamp
-  const exportIterationsToExcel = async () => {
-    try {
-      if (storedReadings.length === 0) {
-        Alert.alert('No Data', 'There are no stored measurements to export.');
-        return;
-      }
+  // Step 1: build the workbook and show the rename modal.
+  // Step 2: doExport() is called when the user confirms the filename.
+  const exportIterationsToExcel = () => {
+    if (storedReadings.length === 0) {
+      Alert.alert('No Data', 'There are no stored measurements to export.');
+      return;
+    }
 
-      // Build flat row list
-      const rows = [];
-      for (const m of storedReadings) {
-        const results = m.iterationResults || [];
-        if (results.length === 0) {
-          // Measurement stored without per-iteration breakdown — treat top-level value as one row
+    // Build flat row list
+    const rows = [];
+    for (const m of storedReadings) {
+      const results = m.iterationResults || [];
+      if (results.length === 0) {
+        rows.push({
+          'S.No': m.serialNo ?? '',
+          'Iteration': 1,
+          'Count': m.value ?? '',
+          'HV (V)': m.hv ?? '',
+          'Preset Time (s)': m.presetTime ?? '',
+          'ACQ Mode': m.acqMode ?? '',
+          'Timestamp': m.timestamp ?? '',
+        });
+      } else {
+        results.forEach((r, idx) => {
           rows.push({
             'S.No': m.serialNo ?? '',
-            'Iteration': 1,
-            'Count': m.value ?? '',
-            'HV (V)': m.hv ?? '',
+            'Iteration': idx + 1,
+            'Count': r.count ?? '',
+            'HV (V)': r.setHv ?? m.hv ?? '',
             'Preset Time (s)': m.presetTime ?? '',
             'ACQ Mode': m.acqMode ?? '',
             'Timestamp': m.timestamp ?? '',
           });
-        } else {
-          results.forEach((r, idx) => {
-            rows.push({
-              'S.No': m.serialNo ?? '',
-              'Iteration': idx + 1,
-              'Count': r.count ?? '',
-              'HV (V)': r.refHv ?? m.hv ?? '',
-              'Preset Time (s)': m.presetTime ?? '',
-              'ACQ Mode': m.acqMode ?? '',
-              'Timestamp': m.timestamp ?? '',
-            });
-          });
-        }
+        });
       }
+    }
 
-      // Build workbook
-      const ws = XLSX.utils.json_to_sheet(rows);
+    // Build workbook
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws['!cols'] = [
+      { wch: 6 },   // S.No
+      { wch: 10 },  // Iteration
+      { wch: 10 },  // Count
+      { wch: 8 },   // HV (V)
+      { wch: 16 },  // Preset Time
+      { wch: 14 },  // ACQ Mode
+      { wch: 22 },  // Timestamp
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Iteration Results');
+    const b64 = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
 
-      // Auto-fit column widths (approximate — based on header and sample data)
-      const colWidths = [
-        { wch: 6 },   // S.No
-        { wch: 10 },  // Iteration
-        { wch: 10 },  // Count
-        { wch: 8 },   // HV (V)
-        { wch: 16 },  // Preset Time
-        { wch: 14 },  // ACQ Mode
-        { wch: 22 },  // Timestamp
-      ];
-      ws['!cols'] = colWidths;
+    // Stash b64 and show rename modal
+    exportPendingRef.current = b64;
+    const dateStr = new Date().toISOString().slice(0, 10);  // YYYY-MM-DD
+    setExportFileName(`NP_Iterations_${dateStr}`);
+    setExportModalVisible(true);
+  };
 
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, 'Iteration Results');
+  // Called when the user confirms the filename in the modal
+  const doExport = async () => {
+    setExportModalVisible(false);
+    const b64 = exportPendingRef.current;
+    if (!b64) return;
+    exportPendingRef.current = null;
 
-      // Write as base64 string (works in React Native)
-      const b64 = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
+    // Sanitise: strip illegal filesystem chars and trailing spaces
+    const safeName = (exportFileName.trim().replace(/[\\/:\*\?"<>|]/g, '_') || 'NP_Export');
+    const fileName = safeName.endsWith('.xlsx') ? safeName : `${safeName}.xlsx`;
 
-      const fileName = `NP_Iterations_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.xlsx`;
+    try {
       const localUri = `${FileSystem.cacheDirectory}${fileName}`;
       await FileSystem.writeAsStringAsync(localUri, b64, { encoding: FileSystem.EncodingType.Base64 });
 
@@ -1091,7 +1102,7 @@ function GMCountingScreen() {
   const recallAvgRefHv = currentRecallEntry ? (() => {
     const r = currentRecallEntry.iterationResults || [];
     const hvVals = r
-      .map((item) => (typeof item === 'object' ? item.refHv : null))
+      .map((item) => (typeof item === 'object' ? item.setHv : null))
       .filter((v) => typeof v === 'number');
     if (hvVals.length === 0) return currentRecallEntry.hv;  // fall back to stored HV
     return Math.round(hvVals.reduce((a, b) => a + b, 0) / hvVals.length);
@@ -1511,6 +1522,47 @@ function GMCountingScreen() {
         </View>
 
       </View>
+
+      {/* ── Export Rename Modal ──────────────────────────────────────────── */}
+      <Modal
+        visible={exportModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => { setExportModalVisible(false); exportPendingRef.current = null; }}
+      >
+        <View style={styles.exportModalOverlay}>
+          <View style={styles.exportModalCard}>
+            <Text style={styles.exportModalTitle}>Name Your Export File</Text>
+            <Text style={styles.exportModalSub}>Enter a filename (without extension):</Text>
+            <TextInput
+              style={styles.exportModalInput}
+              value={exportFileName}
+              onChangeText={setExportFileName}
+              autoFocus
+              selectTextOnFocus
+              maxLength={80}
+              placeholder="NP_Iterations_YYYY-MM-DD"
+              placeholderTextColor="#6a7880"
+            />
+            <Text style={styles.exportModalHint}>.xlsx will be appended automatically</Text>
+            <View style={styles.exportModalBtns}>
+              <TouchableOpacity
+                style={[styles.exportModalBtn, styles.exportModalBtnCancel]}
+                onPress={() => { setExportModalVisible(false); exportPendingRef.current = null; }}
+              >
+                <Text style={styles.exportModalBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.exportModalBtn, styles.exportModalBtnConfirm]}
+                onPress={doExport}
+              >
+                <Text style={[styles.exportModalBtnText, { color: '#fff' }]}>Export</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
     </SafeAreaView>
   );
 }
@@ -2115,6 +2167,89 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: '700',
     color: LABEL_TEXT,
+    fontFamily: MONO,
+    letterSpacing: 0.5,
+  },
+
+  // ── Export Rename Modal ───────────────────────────────────────────────────
+  exportModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  exportModalCard: {
+    backgroundColor: '#1a2e42',
+    borderRadius: 12,
+    padding: 24,
+    width: '100%',
+    maxWidth: 420,
+    borderWidth: 2,
+    borderColor: '#3a6888',
+    elevation: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.5,
+    shadowRadius: 12,
+  },
+  exportModalTitle: {
+    fontSize: 20,
+    fontWeight: '900',
+    color: '#c8e8ff',
+    fontFamily: MONO,
+    letterSpacing: 1,
+    marginBottom: 6,
+  },
+  exportModalSub: {
+    fontSize: 13,
+    color: '#7aaccc',
+    fontFamily: MONO,
+    marginBottom: 12,
+  },
+  exportModalInput: {
+    backgroundColor: '#0d1e2e',
+    borderWidth: 1.5,
+    borderColor: '#3a8aaa',
+    borderRadius: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 16,
+    color: '#c8e8ff',
+    fontFamily: MONO,
+    letterSpacing: 0.5,
+    marginBottom: 6,
+  },
+  exportModalHint: {
+    fontSize: 11,
+    color: '#4a7a9a',
+    fontFamily: MONO,
+    marginBottom: 20,
+  },
+  exportModalBtns: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+  },
+  exportModalBtn: {
+    paddingVertical: 10,
+    paddingHorizontal: 22,
+    borderRadius: 6,
+    borderWidth: 1.5,
+    alignItems: 'center',
+  },
+  exportModalBtnCancel: {
+    borderColor: '#4a6888',
+    backgroundColor: 'transparent',
+  },
+  exportModalBtnConfirm: {
+    borderColor: '#2a8aaa',
+    backgroundColor: '#1a5a7a',
+  },
+  exportModalBtnText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#7aaccc',
     fontFamily: MONO,
     letterSpacing: 0.5,
   },

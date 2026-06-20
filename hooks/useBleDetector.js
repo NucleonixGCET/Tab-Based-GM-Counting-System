@@ -5,13 +5,39 @@
  *
  * Scan strategy:
  *   - No UUID filter → discovers ALL nearby BLE devices
- *   - Auto-connects to first device whose name contains AUTO_CONNECT_KEYWORD
- *   - All other named devices appear in foundDevices for manual selection
+ *   - All named devices appear in foundDevices for manual selection
  *
  * Nordic UART Service UUIDs (nRF52810 default firmware):
  *   Service  : 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
  *   TX char  : 6E400002-B5A3-F393-E0A9-E50E24DCCA9E  (phone → device)
  *   RX char  : 6E400003-B5A3-F393-E0A9-E50E24DCCA9E  (device → phone, monitored)
+ *
+ * ── Frame model (mirrors Serial Bluetooth Monitor behaviour) ──────
+ *
+ *  The firmware transmits 2 frames every 2 seconds.  Each frame represents
+ *  exactly 1 second of detector data:
+ *
+ *    "Counts,<n>,CurHV,<kV>!\r\n"
+ *
+ *  BLE MTU batching may cause the two frames to arrive in a single
+ *  notification, or occasionally 3-4 frames may be batched together.
+ *
+ *  Strategy:
+ *    1. Gate all incoming frames behind collectingRef — only frames that
+ *       arrive AFTER startCollecting() (i.e. after SRTC is sent) are
+ *       accepted.  This discards any HV-settling frames that the device
+ *       may emit immediately after STHV, eliminating HV-spike readings.
+ *    2. Every accepted frame is pushed individually into a FIFO display
+ *       queue (displayQueueRef).
+ *    3. A drain timer releases exactly ONE frame per second from the queue,
+ *       dispatching a LIVE_COUNT action each time.  This gives a perfectly
+ *       steady 1-update/second LCD rate regardless of how the BLE stack
+ *       batches the notifications — identical to what the Serial BT Monitor
+ *       does when it prints one line per received frame.
+ *    4. If more frames are in the queue than have been drained (e.g. 3
+ *       frames arrived in one notification) they simply wait in the FIFO and
+ *       are released in subsequent seconds — no frames are ever dropped and
+ *       no artificial summing or pairing is done.
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -26,130 +52,100 @@ export const UART_TX_CHAR_UUID = '6E400002-B5A3-F393-E0A9-E50E24DCCA9E';
 export const UART_RX_CHAR_UUID = '6E400003-B5A3-F393-E0A9-E50E24DCCA9E';
 
 // ── Scan config ────────────────────────────────────────────────────
-// Any device whose localName contains this string (case-insensitive) will
-// be auto-connected. Everything else goes into the manual picker list.
 export const AUTO_CONNECT_KEYWORD = '52810';
-export const SCAN_TIMEOUT_MS = 20_000;   // 20 s discovery window
-export const DEBOUNCE_MS = 800;
+export const SCAN_TIMEOUT_MS     = 20_000;   // 20 s discovery window
+export const DEBOUNCE_MS         = 800;
 
 // ── Status labels ──────────────────────────────────────────────────
 export const BLE_STATUS = {
-  IDLE: 'IDLE',
-  BLE_OFF: 'BLUETOOTH_OFF',
-  REQUESTING: 'REQUESTING_PERMISSIONS',
-  NO_PERM: 'PERMISSION_DENIED',
-  SCANNING: 'SCANNING',
-  NOT_FOUND: 'DEVICE_NOT_FOUND',
-  CONNECTING: 'CONNECTING',
-  DISCOVERING: 'DISCOVERING_SERVICES',
-  CONNECTED: 'CONNECTED',
-  MONITORING: 'MONITORING',
+  IDLE        : 'IDLE',
+  BLE_OFF     : 'BLUETOOTH_OFF',
+  REQUESTING  : 'REQUESTING_PERMISSIONS',
+  NO_PERM     : 'PERMISSION_DENIED',
+  SCANNING    : 'SCANNING',
+  NOT_FOUND   : 'DEVICE_NOT_FOUND',
+  CONNECTING  : 'CONNECTING',
+  DISCOVERING : 'DISCOVERING_SERVICES',
+  CONNECTED   : 'CONNECTED',
+  MONITORING  : 'MONITORING',
   DISCONNECTED: 'DISCONNECTED',
-  ERROR: 'ERROR',
+  ERROR       : 'ERROR',
 };
 
-// ── State ──────────────────────────────────────────────────────────
+// ── Reducer ────────────────────────────────────────────────────────
 const initialState = {
   bleAdapterState: BleState.Unknown,
-  status: BLE_STATUS.IDLE,
+  status         : BLE_STATUS.IDLE,
   connectedDevice: null,
-  liveCount: null,
-  liveHV: null,   // current HV in Volts (from CurHV field, kV → V)
-  liveCountToken: 0,
-  errorMessage: null,
-  isScanning: false,
-  foundDevices: [],   // [{id, name, rssi}] — for manual picker
+  liveCount      : null,
+  liveHV         : null,
+  liveCountToken : 0,
+  errorMessage   : null,
+  isScanning     : false,
+  foundDevices   : [],
 };
 
 function reducer(state, action) {
   switch (action.type) {
-    case 'BLE_STATE':
-      return { ...state, bleAdapterState: action.payload };
-    case 'STATUS':
-      return { ...state, status: action.payload, errorMessage: null };
-    case 'ERROR':
-      return { ...state, status: BLE_STATUS.ERROR, errorMessage: action.payload };
-    case 'CONNECTED':
-      return { ...state, status: BLE_STATUS.CONNECTED, connectedDevice: action.payload, errorMessage: null };
-    case 'MONITORING':
-      return { ...state, status: BLE_STATUS.MONITORING };
-    case 'LIVE_COUNT':
-      return {
-        ...state,
-        liveCount: action.payload.count,
-        liveHV: action.payload.hv ?? state.liveHV,
-        liveCountToken: (state.liveCountToken ?? 0) + 1,
-      };
-    case 'SCANNING':
-      return {
-        ...state,
-        isScanning: action.payload,
-        status: action.payload ? BLE_STATUS.SCANNING : state.status,
-        foundDevices: action.payload ? [] : state.foundDevices, // clear list on new scan
-      };
+    case 'BLE_STATE' : return { ...state, bleAdapterState: action.payload };
+    case 'STATUS'    : return { ...state, status: action.payload, errorMessage: null };
+    case 'ERROR'     : return { ...state, status: BLE_STATUS.ERROR, errorMessage: action.payload };
+    case 'CONNECTED' : return { ...state, status: BLE_STATUS.CONNECTED, connectedDevice: action.payload, errorMessage: null };
+    case 'MONITORING': return { ...state, status: BLE_STATUS.MONITORING };
+    case 'LIVE_COUNT': return {
+      ...state,
+      liveCount     : action.payload.count,
+      liveHV        : action.payload.hv ?? state.liveHV,
+      liveCountToken: (state.liveCountToken ?? 0) + 1,
+    };
+    case 'SCANNING': return {
+      ...state,
+      isScanning  : action.payload,
+      status      : action.payload ? BLE_STATUS.SCANNING : state.status,
+      foundDevices: action.payload ? [] : state.foundDevices,
+    };
     case 'DEVICE_FOUND': {
-      // Deduplicate by device ID; update RSSI if seen again
       const exists = state.foundDevices.find(d => d.id === action.payload.id);
       if (exists) return state;
       return { ...state, foundDevices: [...state.foundDevices, action.payload] };
     }
-    case 'DISCONNECTED':
-      return { ...state, status: BLE_STATUS.DISCONNECTED, connectedDevice: null, isScanning: false };
-    case 'RESET':
-      return { ...initialState, bleAdapterState: state.bleAdapterState };
-    default:
-      return state;
+    case 'DISCONNECTED': return { ...state, status: BLE_STATUS.DISCONNECTED, connectedDevice: null, isScanning: false };
+    case 'RESET'       : return { ...initialState, bleAdapterState: state.bleAdapterState };
+    default            : return state;
   }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
-function decodeCharacteristicValue(base64Value) {
+function decodeCharValue(base64Value) {
   if (!base64Value) return '';
-  try {
-    return decodeBase64(base64Value);
-  } catch (e) {
-    console.warn('[BLE] Base64 decode error:', e.message);
-    return '';
-  }
+  try   { return decodeBase64(base64Value); }
+  catch (e) { console.warn('[BLE] Base64 decode error:', e.message); return ''; }
 }
 
 /**
- * Parses one BLE frame from the ESP32 detector.
+ * parseFrames(rawText)
  *
- * Firmware format (one or many per BLE notification):
- *   "Counts,<n>,CurHV,<kV>!\r\n"
- *   e.g. "Counts,12,CurHV,2.315!\r\n"
- *
- * Edge-cases handled:
- *   - Multiple readings batched in a single BLE notification (MTU batching)
- *   - Fragmented packets (partial frame at start/end of buffer)
- *
+ * Extracts all complete "Counts,N,CurHV,F!" messages from a raw string.
  * Returns an array of { count: number, hv: number|null } objects.
- * hv is in Volts (converted from kV by multiplying by 1000).
+ *
+ * HV conversion:
+ *   - Value < 10  → device sent kV  (e.g. 0.497) → multiply × 1000 → Volts
+ *   - Value ≥ 10  → device sent Volts directly    → round to integer
  */
-function parseFrame(rawText) {
+function parseFrames(rawText) {
   if (!rawText) return [];
-  // Match "Counts,<integer>,CurHV,<float>!" — all parts optional for resilience
-  // Also handles legacy "Cnts:<n>!" format for backward compatibility
   const results = [];
 
   // Primary format: Counts,N,CurHV,F!
-  const newFmt = rawText.matchAll(/Counts,(\d+),CurHV,([\d.]+)!/g);
-  for (const m of newFmt) {
-    const hvRaw = parseFloat(m[2]);
-    // The device alternately sends HV as kV (e.g. "0.397") or already in Volts
-    // (e.g. "397"). Values >= 10 are already in Volts; values < 10 are in kV.
+  for (const m of rawText.matchAll(/Counts,(\d+),CurHV,([\d.]+)!/g)) {
+    const hvRaw   = parseFloat(m[2]);
     const hvVolts = hvRaw >= 10 ? Math.round(hvRaw) : Math.round(hvRaw * 1000);
-    results.push({
-      count: parseInt(m[1], 10),
-      hv: hvVolts,
-    });
+    results.push({ count: parseInt(m[1], 10), hv: hvVolts });
   }
 
-  // If nothing matched above, fall back to legacy format "C?nts:<n>!"
+  // Legacy fallback: C?nts:N!
   if (results.length === 0) {
-    const legacyFmt = rawText.matchAll(/C?nts:(\d+)!/g);
-    for (const m of legacyFmt) {
+    for (const m of rawText.matchAll(/C?nts:(\d+)!/g)) {
       results.push({ count: parseInt(m[1], 10), hv: null });
     }
   }
@@ -157,7 +153,7 @@ function parseFrame(rawText) {
   return results;
 }
 
-
+// ── Android permission helper ───────────────────────────────────────
 async function requestAndroidPermissions() {
   if (Platform.OS !== 'android') return true;
   if (Platform.Version >= 31) {
@@ -171,7 +167,7 @@ async function requestAndroidPermissions() {
   }
   const result = await PermissionsAndroid.request(
     PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-    { title: 'Location Permission', message: 'Required for Bluetooth scanning.', buttonPositive: 'Allow' }
+    { title: 'Location Permission', message: 'Required for Bluetooth scanning.', buttonPositive: 'Allow' },
   );
   return result === PermissionsAndroid.RESULTS.GRANTED;
 }
@@ -180,28 +176,41 @@ async function requestAndroidPermissions() {
 export function useBleDetector({ onCountReceived } = {}) {
   const [state, dispatch] = useReducer(reducer, initialState);
 
-  const managerRef = useRef(null);
-  const scanTimerRef = useRef(null);
-  const monitorSubRef = useRef(null);
-  const isScanningRef = useRef(false);    // avoids stale closure in timeout
-  const isConnectingRef = useRef(false);   // prevents double-connect
-  // Writable char UUIDs discovered during service enumeration (used by sendCommand)
-  const writeSvcUUIDRef = useRef(UART_SERVICE_UUID);
+  const managerRef       = useRef(null);
+  const scanTimerRef     = useRef(null);
+  const monitorSubRef    = useRef(null);
+  const isScanningRef    = useRef(false);
+  const isConnectingRef  = useRef(false);
+  const writeSvcUUIDRef  = useRef(UART_SERVICE_UUID);
   const writeCharUUIDRef = useRef(UART_TX_CHAR_UUID);
+  const retryCountRef    = useRef(0);
 
-  // ── BLE manager state ──────────────────────────────────────────
-  const retryCountRef = useRef(0);        // stale-connection auto-retry counter
-  const frameQueueRef = useRef([]);
+  // ── Incoming BLE reassembly buffer ────────────────────────────
+  // BLE packets may be fragmented; we accumulate until we see '!' terminators.
   const bleBufferRef = useRef('');
 
-  // ── Display queue: drains 1 frame/second for smooth UI updates ──
-  // Frames arrive in bursts of 1–4 every ~5 s from firmware.
-  // We buffer them here and release one per second so the LCD
-  // shows a steady update rate instead of jumping all at once.
-  const displayQueueRef = useRef([]);
-  const displayDrainRef = useRef(null);
+  // ── Collection gate ───────────────────────────────────────────
+  // When false (default), ALL incoming frames are discarded.
+  // Set to true by startCollecting() which is called right after SRTC is
+  // confirmed sent.  This ensures that any frames the device emits while HV
+  // is settling (between STHV and SRTC) are never stored or displayed.
+  const collectingRef = useRef(false);
 
-  // ── BLE Manager lifecycle ──────────────────────────────────────
+  // ── Display queue ─────────────────────────────────────────────
+  // Each element is a { count, hv } frame representing exactly 1 second of
+  // detector data.  The drain timer below releases one element per second,
+  // producing a steady 1 Hz LCD update that matches what the Serial BT
+  // Monitor shows when it prints one line per received frame.
+  const displayQueueRef = useRef([]);
+  const displayDrainRef = useRef(null);  // setInterval handle
+
+  // ── frameQueueRef ─────────────────────────────────────────────
+  // Secondary queue used by the App.js counting loop (flushFrames / popFrame).
+  const frameQueueRef = useRef([]);
+
+  // ─────────────────────────────────────────────────────────────
+  // BLE Manager lifecycle
+  // ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const manager = new BleManager();
     managerRef.current = manager;
@@ -223,12 +232,12 @@ export function useBleDetector({ onCountReceived } = {}) {
     };
   }, []);
 
-  // ── Internals ──────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // Internal helpers
+  // ─────────────────────────────────────────────────────────────
+
   function _stopScan() {
-    if (scanTimerRef.current) {
-      clearTimeout(scanTimerRef.current);
-      scanTimerRef.current = null;
-    }
+    if (scanTimerRef.current) { clearTimeout(scanTimerRef.current); scanTimerRef.current = null; }
     isScanningRef.current = false;
     managerRef.current?.stopDeviceScan();
     dispatch({ type: 'SCANNING', payload: false });
@@ -237,39 +246,54 @@ export function useBleDetector({ onCountReceived } = {}) {
   function _stopMonitor() {
     monitorSubRef.current?.remove();
     monitorSubRef.current = null;
-    // Stop the display drain timer and clear the display queue
+    _stopDrain();
+  }
+
+  /** Stop the drain timer and wipe both queues + the collecting gate. */
+  function _stopDrain() {
     if (displayDrainRef.current) {
       clearInterval(displayDrainRef.current);
       displayDrainRef.current = null;
     }
     displayQueueRef.current = [];
+    frameQueueRef.current   = [];
+    collectingRef.current   = false;
+    bleBufferRef.current    = '';
   }
 
-  function _startDisplayDrain() {
-    // Only one drain timer at a time
-    if (displayDrainRef.current) return;
+  /**
+   * _startDrain()
+   *
+   * Ensures the 1-per-second drain timer is running.
+   *
+   * First call: dispatches the oldest queued frame immediately (0 ms delay)
+   *   so a 1-frame-per-second stream is shown in real time rather than with
+   *   a 1 s lag.
+   * Subsequent frames: released one per second by the interval.
+   * Auto-stop: when the queue becomes empty the interval clears itself.
+   *
+   * Guard: if the drain is already running when new frames are pushed, nothing
+   * extra is needed — the interval will keep popping until empty.
+   */
+  function _startDrain() {
+    if (displayDrainRef.current) return; // drain already running
 
-    // Dispatch the first frame immediately (0 ms delay) so a 1-frame-per-second
-    // stream from the device is shown in real time instead of 1 second late.
-    const firstFrame = displayQueueRef.current.shift();
-    if (firstFrame) {
-      dispatch({ type: 'LIVE_COUNT', payload: firstFrame });
-      // Fire callback NOW for first frame so it's counted in real time
-      onCountReceived?.(firstFrame.count);
+    // Dispatch the first frame immediately
+    const first = displayQueueRef.current.shift();
+    if (first) {
+      dispatch({ type: 'LIVE_COUNT', payload: first });
+      onCountReceived?.(first.count);
     }
 
-    // If the queue is already empty after the first frame, no interval needed.
-    if (displayQueueRef.current.length === 0) return;
+    if (displayQueueRef.current.length === 0) return; // nothing more to drain
 
-    // For any additional queued frames, release one per second.
     displayDrainRef.current = setInterval(() => {
       const frame = displayQueueRef.current.shift();
       if (frame) {
         dispatch({ type: 'LIVE_COUNT', payload: frame });
-        // Fire callback synchronized with frame display (1 per second)
         onCountReceived?.(frame.count);
       }
-      // Auto-stop the timer when the queue drains
+      // Auto-cancel when queue drains completely
       if (displayQueueRef.current.length === 0) {
         clearInterval(displayDrainRef.current);
         displayDrainRef.current = null;
@@ -277,11 +301,14 @@ export function useBleDetector({ onCountReceived } = {}) {
     }, 1000);
   }
 
-
+  // ─────────────────────────────────────────────────────────────
+  // BLE monitor (characteristic notification callback)
+  // ─────────────────────────────────────────────────────────────
 
   async function _startMonitor(device) {
     dispatch({ type: 'STATUS', payload: BLE_STATUS.DISCOVERING });
     bleBufferRef.current = '';
+
     try {
       await device.discoverAllServicesAndCharacteristics();
     } catch (e) {
@@ -291,8 +318,8 @@ export function useBleDetector({ onCountReceived } = {}) {
       return;
     }
 
-    // ── Log every service + characteristic so we can see the real UUIDs ──
-    let notifySvcUUID = null;
+    // Enumerate services to find the correct notify / write characteristics
+    let notifySvcUUID  = null;
     let notifyCharUUID = null;
     try {
       const services = await device.services();
@@ -305,18 +332,15 @@ export function useBleDetector({ onCountReceived } = {}) {
             ` | notify=${ch.isNotifiable}` +
             ` | indicate=${ch.isIndicatable}` +
             ` | read=${ch.isReadable}` +
-            ` | write=${ch.isWritableWithResponse}`
+            ` | write=${ch.isWritableWithResponse}`,
           );
-          // Prefer a characteristic that is notifiable but NOT writable —
-          // that's the RX channel (data FROM device). Skip TX (write+notify).
           const isPureNotify = (ch.isNotifiable || ch.isIndicatable) && !ch.isWritableWithResponse;
           if (!notifyCharUUID && isPureNotify) {
-            notifySvcUUID = svc.uuid;
+            notifySvcUUID  = svc.uuid;
             notifyCharUUID = ch.uuid;
           }
-          // Track writable characteristic (TX — phone → device)
           if (ch.isWritableWithResponse || ch.isWritableWithoutResponse) {
-            writeSvcUUIDRef.current = svc.uuid;
+            writeSvcUUIDRef.current  = svc.uuid;
             writeCharUUIDRef.current = ch.uuid;
             console.log('[BLE] Write char discovered:', ch.uuid);
           }
@@ -326,8 +350,7 @@ export function useBleDetector({ onCountReceived } = {}) {
       console.warn('[BLE] Could not enumerate services:', e.message);
     }
 
-    // Fall back to hardcoded Nordic UART UUIDs if auto-detect missed
-    const svcUUID = notifySvcUUID ?? UART_SERVICE_UUID;
+    const svcUUID  = notifySvcUUID  ?? UART_SERVICE_UUID;
     const charUUID = notifyCharUUID ?? UART_RX_CHAR_UUID;
     console.log(`[BLE] Monitoring  svc=${svcUUID}  char=${charUUID}`);
 
@@ -355,6 +378,7 @@ export function useBleDetector({ onCountReceived } = {}) {
       }
     });
 
+    // ── The core notification callback ──────────────────────────────────────
     monitorSubRef.current = device.monitorCharacteristicForService(
       svcUUID,
       charUUID,
@@ -366,33 +390,45 @@ export function useBleDetector({ onCountReceived } = {}) {
           }
           return;
         }
-        const raw = decodeCharacteristicValue(characteristic?.value);
+
+        // ── Gate: discard everything until startCollecting() is called ──────
+        // This prevents HV-settling frames (emitted by the device between
+        // STHV and SRTC) from ever reaching the display queue or count store.
+        if (!collectingRef.current) return;
+
+        // ── Reassemble fragmented BLE packets ──────────────────────────────
+        // Append raw bytes to the buffer and split on '!' terminators.
+        // The tail after the last '!' (possibly empty or a partial frame)
+        // is kept in bleBufferRef for the next notification.
+        const raw = decodeCharValue(characteristic?.value);
         bleBufferRef.current += raw;
 
         const parts = bleBufferRef.current.split('!');
-        bleBufferRef.current = parts.pop() || '';
+        bleBufferRef.current = parts.pop() ?? ''; // save incomplete tail
 
+        // ── Parse each complete segment ────────────────────────────────────
         const frames = [];
         for (const part of parts) {
-          const parsed = parseFrame(part + '!');
-          if (parsed.length > 0) {
-            frames.push(...parsed);
-          }
+          const parsed = parseFrames(part + '!');
+          frames.push(...parsed);
         }
 
-        if (frames.length > 0) {
-          console.log('[BLE] Processing parsed frames:', JSON.stringify(frames));
-          for (const frame of frames) {
-            // Push to counting queue (used by flushFrames in the tick loop)
-            frameQueueRef.current.push(frame);
-            // Push to display queue (drained 1 frame/sec for smooth LCD updates)
-            displayQueueRef.current.push(frame);
-            // Callback will be fired from _startDisplayDrain() when frame is actually displayed
-          }
-          // Kick off (or continue) the 1-second display drain
-          _startDisplayDrain();
+        if (frames.length === 0) return;
+
+        console.log('[BLE] Frames received:', JSON.stringify(frames));
+
+        // ── Enqueue every frame individually ───────────────────────────────
+        // Each frame = 1 second of detector data, just like the Serial BT
+        // Monitor displays one line per frame.  The drain timer will release
+        // them one per second, producing a lag-free 1 Hz display update.
+        for (const frame of frames) {
+          frameQueueRef.current.push(frame);
+          displayQueueRef.current.push(frame);
         }
-      }
+
+        // Start (or continue) the 1-per-second drain
+        _startDrain();
+      },
     );
   }
 
@@ -404,23 +440,14 @@ export function useBleDetector({ onCountReceived } = {}) {
     dispatch({ type: 'STATUS', payload: BLE_STATUS.CONNECTING });
     console.log('[BLE] Connecting to', device.name ?? device.localName ?? device.id);
 
-    // Cancel any stale native connection for this device ID before
-    // trying to connect — prevents immediate disconnect on hot-reload.
-    try {
-      await managerRef.current.cancelDeviceConnection(device.id);
-      console.log('[BLE] Cleared stale connection for', device.id);
-    } catch (_) {
-      // No existing connection — that's fine, continue.
-    }
+    try { await managerRef.current.cancelDeviceConnection(device.id); }
+    catch (_) { /* no stale connection — fine */ }
 
     try {
       const connected = await device.connect({ timeout: 10_000, autoConnect: false });
       console.log('[BLE] Connected:', connected.id);
       dispatch({ type: 'CONNECTED', payload: connected });
-
-      // Give the device 400 ms to stabilize before GATT operations.
       await new Promise(resolve => setTimeout(resolve, 400));
-
       await _startMonitor(connected);
     } catch (e) {
       console.error('[BLE] Connection failed:', e.message, '| code:', e.errorCode);
@@ -429,7 +456,9 @@ export function useBleDetector({ onCountReceived } = {}) {
     }
   }
 
-  // ── Public API ─────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // Public API
+  // ─────────────────────────────────────────────────────────────
 
   const requestPermissions = useCallback(async () => {
     dispatch({ type: 'STATUS', payload: BLE_STATUS.REQUESTING });
@@ -446,104 +475,66 @@ export function useBleDetector({ onCountReceived } = {}) {
   const startScan = useCallback(async () => {
     const manager = managerRef.current;
     if (!manager) return;
-
     if (state.bleAdapterState !== BleState.PoweredOn) {
       Alert.alert('Bluetooth Off', 'Please enable Bluetooth first.');
       return;
     }
     if (isScanningRef.current || state.connectedDevice) return;
 
-    // Ensure Android permissions
     if (Platform.OS === 'android') {
       const granted = await requestAndroidPermissions();
-      if (!granted) {
-        dispatch({ type: 'STATUS', payload: BLE_STATUS.NO_PERM });
-        return;
-      }
+      if (!granted) { dispatch({ type: 'STATUS', payload: BLE_STATUS.NO_PERM }); return; }
     }
 
     _stopMonitor();
     isConnectingRef.current = false;
-    isScanningRef.current = true;
+    isScanningRef.current   = true;
     dispatch({ type: 'SCANNING', payload: true });
-
     console.log('[BLE] Scan started — no UUID filter, open discovery');
 
-    manager.startDeviceScan(
-      null,                         // ← null = scan ALL BLE devices, no UUID filter
-      { allowDuplicates: false },
-      async (error, device) => {
-        if (error) {
-          console.error('[BLE] Scan error:', error.message, '| code:', error.errorCode);
-          dispatch({ type: 'ERROR', payload: `Scan error (code ${error.errorCode ?? '?'})` });
-          _stopScan();
-          return;
-        }
-        if (!device) return;
-
-        const name = device.localName ?? device.name ?? '';
-        if (!name) return;  // skip anonymous devices (no name = not our device)
-
-        console.log('[BLE] Discovered:', name, '| RSSI:', device.rssi, '| ID:', device.id);
-
-        // Add to picker list
-        dispatch({
-          type: 'DEVICE_FOUND',
-          payload: { id: device.id, name, rssi: device.rssi ?? 0 },
-        });
-
-        // Auto-connect disabled: device is added to picker list for manual connection.
-        // User must tap the device row (or press CONNECT) in BleConnectionScreen.
-        if (name.toLowerCase().includes(AUTO_CONNECT_KEYWORD.toLowerCase())) {
-          console.log('[BLE] Detector found (awaiting manual connect):', name);
-        }
+    manager.startDeviceScan(null, { allowDuplicates: false }, async (error, device) => {
+      if (error) {
+        console.error('[BLE] Scan error:', error.message, '| code:', error.errorCode);
+        dispatch({ type: 'ERROR', payload: `Scan error (code ${error.errorCode ?? '?'})` });
+        _stopScan();
+        return;
       }
-    );
+      if (!device) return;
+      const name = device.localName ?? device.name ?? '';
+      if (!name) return;
 
-    // Auto-stop after timeout using ref (not stale state)
+      console.log('[BLE] Discovered:', name, '| RSSI:', device.rssi, '| ID:', device.id);
+      dispatch({ type: 'DEVICE_FOUND', payload: { id: device.id, name, rssi: device.rssi ?? 0 } });
+      if (name.toLowerCase().includes(AUTO_CONNECT_KEYWORD.toLowerCase())) {
+        console.log('[BLE] Detector found (awaiting manual connect):', name);
+      }
+    });
+
     scanTimerRef.current = setTimeout(() => {
       if (isScanningRef.current) {
-        console.warn('[BLE] Scan timeout — no auto-connect device found.');
+        console.warn('[BLE] Scan timeout — no device found.');
         _stopScan();
         dispatch({ type: 'STATUS', payload: BLE_STATUS.NOT_FOUND });
       }
     }, SCAN_TIMEOUT_MS);
-
   }, [state.bleAdapterState, state.connectedDevice]);
 
-  /** Manually connect to a device from the picker list */
   const connectToDevice = useCallback(async (deviceId) => {
     const manager = managerRef.current;
-    if (!manager) return;
-    if (isConnectingRef.current) return;   // prevent double-tap
+    if (!manager || isConnectingRef.current) return;
     isConnectingRef.current = true;
 
-    // 1. Stop scan — an active scan conflicts with connection on Android
     _stopScan();
     dispatch({ type: 'STATUS', payload: BLE_STATUS.CONNECTING });
 
-    // 2. Cancel any lingering native connection for this device ID
-    try {
-      await manager.cancelDeviceConnection(deviceId);
-      console.log('[BLE] Cleared stale connection for', deviceId);
-    } catch (_) {
-      // No existing connection — fine, continue.
-    }
-
-    // 3. Short settle delay so Android BLE stack is ready
+    try { await manager.cancelDeviceConnection(deviceId); } catch (_) { }
     await new Promise(resolve => setTimeout(resolve, 300));
 
     try {
-      const device = await manager.connectToDevice(deviceId, {
-        timeout: 10_000,
-        autoConnect: false,
-      });
+      const device = await manager.connectToDevice(deviceId, { timeout: 10_000, autoConnect: false });
       console.log('[BLE] Manually connected to:', device.id);
       dispatch({ type: 'CONNECTED', payload: device });
-
-      // 4. Stabilise before GATT operations (same as auto-connect path)
       await new Promise(resolve => setTimeout(resolve, 400));
-
       await _startMonitor(device);
     } catch (e) {
       console.error('[BLE] Manual connect failed:', e.message, '| code:', e.errorCode);
@@ -554,11 +545,8 @@ export function useBleDetector({ onCountReceived } = {}) {
 
   const disconnect = useCallback(async () => {
     _stopMonitor();
-    bleBufferRef.current = '';
     const device = state.connectedDevice;
-    if (device) {
-      try { await device.cancelConnection(); } catch (_) { }
-    }
+    if (device) { try { await device.cancelConnection(); } catch (_) { } }
     dispatch({ type: 'DISCONNECTED' });
   }, [state.connectedDevice]);
 
@@ -572,17 +560,9 @@ export function useBleDetector({ onCountReceived } = {}) {
     dispatch({ type: 'RESET' });
   }, [disconnect]);
 
-  /**
-   * Send a plain-text command string to the connected scintillator device.
-   * The string is Base64-encoded and written to the writable UART TX characteristic.
-   * Example: sendCommand('STHV 400')
-   */
   const sendCommand = useCallback(async (text) => {
     const device = state.connectedDevice;
-    if (!device) {
-      console.warn('[BLE] sendCommand: no connected device');
-      return false;
-    }
+    if (!device) { console.warn('[BLE] sendCommand: no connected device'); return false; }
     try {
       const encoded = encodeBase64(text);
       await device.writeCharacteristicWithResponseForService(
@@ -598,6 +578,53 @@ export function useBleDetector({ onCountReceived } = {}) {
     }
   }, [state.connectedDevice]);
 
+  /**
+   * startCollecting()
+   *
+   * Opens the collection gate.  Must be called immediately after the SRTC
+   * command is confirmed sent to the device.  Any frames that arrived during
+   * the HV-settling window (after STHV, before SRTC) are silently discarded
+   * by the gate check inside the notification callback.
+   *
+   * The reassembly buffer is cleared so partial data from the pre-warm period
+   * cannot bleed into the first real frame.
+   */
+  const startCollecting = useCallback(() => {
+    bleBufferRef.current  = ''; // discard any pre-warm partial data
+    collectingRef.current = true;
+    console.log('[BLE] startCollecting: gate OPEN — frames will now be queued');
+  }, []);
+
+  /**
+   * stopCollecting()
+   *
+   * Closes the collection gate.  Call this when STPC is sent or a run is
+   * manually aborted.  In-flight frames that arrive after this point are
+   * discarded, preventing stale data from appearing after the run ends.
+   */
+  const stopCollecting = useCallback(() => {
+    collectingRef.current = false;
+    console.log('[BLE] stopCollecting: gate CLOSED — incoming frames discarded');
+  }, []);
+
+  /**
+   * clearQueue()
+   *
+   * Stops the drain timer and empties both queues (display + frame).
+   * Call this between iterations or at run start to guarantee a clean slate.
+   * The collection gate is intentionally NOT touched here — it remains in
+   * whatever state the caller set it to.
+   */
+  const clearQueue = useCallback(() => {
+    if (displayDrainRef.current) {
+      clearInterval(displayDrainRef.current);
+      displayDrainRef.current = null;
+    }
+    displayQueueRef.current = [];
+    frameQueueRef.current   = [];
+    console.log('[BLE] clearQueue: display and frame queues flushed');
+  }, []);
+
   const popFrame = useCallback(() => {
     return frameQueueRef.current.shift() ?? null;
   }, []);
@@ -608,31 +635,28 @@ export function useBleDetector({ onCountReceived } = {}) {
     return frames;
   }, []);
 
-  const clearQueue = useCallback(() => {
-    frameQueueRef.current = [];
-    displayQueueRef.current = [];
-  }, []);
-
   return {
-    bleAdapterState: state.bleAdapterState,
-    status: state.status,
-    connectedDevice: state.connectedDevice,
-    liveCount: state.liveCount,
-    liveHV: state.liveHV,         // ← current HV in Volts from device
-    liveCountToken: state.liveCountToken,
-    errorMessage: state.errorMessage,
-    isScanning: state.isScanning,
-    isConnected: state.status === BLE_STATUS.MONITORING,
-    foundDevices: state.foundDevices,   // ← exposed for picker UI
+    bleAdapterState : state.bleAdapterState,
+    status          : state.status,
+    connectedDevice : state.connectedDevice,
+    liveCount       : state.liveCount,
+    liveHV          : state.liveHV,
+    liveCountToken  : state.liveCountToken,
+    errorMessage    : state.errorMessage,
+    isScanning      : state.isScanning,
+    isConnected     : state.status === BLE_STATUS.MONITORING,
+    foundDevices    : state.foundDevices,
     requestPermissions,
     startScan,
     stopScan,
-    connectToDevice,  // ← manual connect by ID
+    connectToDevice,
     disconnect,
     reset,
-    sendCommand,      // ← write a text command to the device
+    sendCommand,
+    startCollecting,   // call after SRTC confirmed → opens frame gate
+    stopCollecting,    // call after STPC / run abort → closes frame gate
+    clearQueue,
     popFrame,
     flushFrames,
-    clearQueue,
   };
 }
