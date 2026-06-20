@@ -131,16 +131,27 @@ function decodeCharValue(base64Value) {
  * HV conversion:
  *   - Value < 10  → device sent kV  (e.g. 0.497) → multiply × 1000 → Volts
  *   - Value ≥ 10  → device sent Volts directly    → round to integer
+ *
+ * HV validation: 
+ *   - Hard bounds: 0-1600V (nRF52810 max rating with margin)
+ *   - This function doesn't know expected HV, so adaptive validation
+ *     happens in the notification callback via recentHvRef.
  */
 function parseFrames(rawText) {
   if (!rawText) return [];
   const results = [];
+  const HV_MIN = 0;
+  const HV_MAX = 1600;
 
   // Primary format: Counts,N,CurHV,F!
   for (const m of rawText.matchAll(/Counts,(\d+),CurHV,([\d.]+)!/g)) {
     const hvRaw   = parseFloat(m[2]);
     const hvVolts = hvRaw >= 10 ? Math.round(hvRaw) : Math.round(hvRaw * 1000);
-    results.push({ count: parseInt(m[1], 10), hv: hvVolts });
+    
+    // Hard bounds check only; adaptive filtering happens at notification level
+    if (hvVolts >= HV_MIN && hvVolts <= HV_MAX) {
+      results.push({ count: parseInt(m[1], 10), hv: hvVolts });
+    }
   }
 
   // Legacy fallback: C?nts:N!
@@ -208,6 +219,28 @@ export function useBleDetector({ onCountReceived } = {}) {
   // Secondary queue used by the App.js counting loop (flushFrames / popFrame).
   const frameQueueRef = useRef([]);
 
+  // ── Throttle state updates to reduce re-renders on low-end devices ────
+  // Instead of updating state for every frame, batch updates using RAF.
+  // This prevents the main thread from being overwhelmed by React updates.
+  const pendingFrameRef = useRef(null);
+  const rafIdRef = useRef(null);
+  const drainScheduledRef = useRef(false);
+
+  // ── HV stabilization grace period ────────────────────────────────────
+  // When HV is changed, the device takes time to settle. During this time,
+  // it emits frames at intermediate or old voltages. We discard frames during
+  // a grace period after startCollecting() to ensure only stable data is collected.
+  const stabilizationEndTimeRef = useRef(0);
+
+  // ── Adaptive HV validation ────────────────────────────────────────────
+  // Track recent valid HV readings to detect and reject corrupted frames.
+  // Frames with HV values > 30V away from the median are filtered out.
+  // This prevents frame boundary corruption (970V, 930V, 10V, 80V, etc.) from
+  // polluting the data while allowing normal device drift (±10-15V).
+  const recentHvRef = useRef([]);  // sliding window of last 10 valid HV readings
+  const HV_MEDIAN_WINDOW = 10;
+  const HV_DEVIATION_THRESHOLD = 30;  // reject if > 30V from median
+
   // ─────────────────────────────────────────────────────────────
   // BLE Manager lifecycle
   // ─────────────────────────────────────────────────────────────
@@ -255,6 +288,13 @@ export function useBleDetector({ onCountReceived } = {}) {
       clearInterval(displayDrainRef.current);
       displayDrainRef.current = null;
     }
+    if (rafIdRef.current) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+    drainScheduledRef.current = false;
+    stabilizationEndTimeRef.current = 0; // reset grace period
+    recentHvRef.current = []; // reset HV history
     displayQueueRef.current = [];
     frameQueueRef.current   = [];
     collectingRef.current   = false;
@@ -262,34 +302,79 @@ export function useBleDetector({ onCountReceived } = {}) {
   }
 
   /**
+   * isHvValid(hvVolts)
+   *
+   * Adaptive HV validation using a sliding window of recent readings.
+   * - First 3 readings: always accepted (bootstrap phase)
+   * - After 3 readings: accept if within ±30V of the median
+   * - This rejects corrupted values (970V, 930V, 10V, 80V, etc.) while
+   *   allowing normal device drift (±10-15V typical).
+   */
+  function isHvValid(hvVolts) {
+    // Always accept if we don't have enough history yet
+    if (recentHvRef.current.length < 3) {
+      recentHvRef.current.push(hvVolts);
+      return true;
+    }
+
+    // Calculate median of recent readings
+    const sorted = [...recentHvRef.current].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+
+    // Accept if within ±30V of median
+    const isValid = Math.abs(hvVolts - median) <= HV_DEVIATION_THRESHOLD;
+
+    if (isValid) {
+      // Add to sliding window
+      recentHvRef.current.push(hvVolts);
+      if (recentHvRef.current.length > HV_MEDIAN_WINDOW) {
+        recentHvRef.current.shift();
+      }
+    } else {
+      console.warn(`[BLE] Frame rejected: HV=${hvVolts}V is >30V from median=${median}V (likely corrupted)`);
+    }
+
+    return isValid;
+  }
+
+  /**
    * _startDrain()
    *
    * Ensures the 1-per-second drain timer is running.
    *
-   * First call: dispatches the oldest queued frame immediately (0 ms delay)
-   *   so a 1-frame-per-second stream is shown in real time rather than with
-   *   a 1 s lag.
-   * Subsequent frames: released one per second by the interval.
-   * Auto-stop: when the queue becomes empty the interval clears itself.
+   * OPTIMIZATION STRATEGY:
+   * - For responsive behavior at LOW frame rates (sporadic arrival like at 400HV):
+   *   Dispatch the first frame IMMEDIATELY, not via RAF. This prevents lag.
+   * - For HIGH frame rates (batched notifications like at 500+HV):
+   *   RAF batching still applies to the initial _startDrain() call from the
+   *   notification handler, which prevents flooding React. But once the drain
+   *   timer is active, frames queue normally.
+   * - Subsequent frames: released one per second by the interval.
+   * - Auto-stop: when the queue becomes empty the interval clears itself.
    *
    * Guard: if the drain is already running when new frames are pushed, nothing
    * extra is needed — the interval will keep popping until empty.
    */
   function _startDrain() {
-    if (displayDrainRef.current) return; // drain already running
+    if (displayDrainRef.current) return; // drain interval already running
+    if (displayQueueRef.current.length === 0) return; // nothing to drain
 
-    // Dispatch the first frame immediately
+    // IMMEDIATE dispatch of first frame (no RAF delay)
+    // This ensures responsive behavior at low frame rates
     const first = displayQueueRef.current.shift();
     if (first) {
+      pendingFrameRef.current = first;
       dispatch({ type: 'LIVE_COUNT', payload: first });
       onCountReceived?.(first.count);
     }
 
     if (displayQueueRef.current.length === 0) return; // nothing more to drain
 
+    // Set up the 1-per-second interval for subsequent frames
     displayDrainRef.current = setInterval(() => {
       const frame = displayQueueRef.current.shift();
       if (frame) {
+        pendingFrameRef.current = frame;
         dispatch({ type: 'LIVE_COUNT', payload: frame });
         onCountReceived?.(frame.count);
       }
@@ -396,11 +481,23 @@ export function useBleDetector({ onCountReceived } = {}) {
         // STHV and SRTC) from ever reaching the display queue or count store.
         if (!collectingRef.current) return;
 
+        // ── HV stabilization grace period ─────────────────────────────────
+        // After SRTC, the device needs time to stabilize at the new HV voltage.
+        // During the first 500ms, frames may still reflect old/intermediate voltages
+        // or arrive from the pre-warm period. Discard them to ensure only stable data.
+        const now = Date.now();
+        if (now < stabilizationEndTimeRef.current) {
+          console.log('[BLE] Discarding frame during stabilization grace period (HV settling)');
+          return;
+        }
+
         // ── Reassemble fragmented BLE packets ──────────────────────────────
         // Append raw bytes to the buffer and split on '!' terminators.
         // The tail after the last '!' (possibly empty or a partial frame)
         // is kept in bleBufferRef for the next notification.
         const raw = decodeCharValue(characteristic?.value);
+        if (!raw) return; // empty notification
+        
         bleBufferRef.current += raw;
 
         const parts = bleBufferRef.current.split('!');
@@ -410,7 +507,12 @@ export function useBleDetector({ onCountReceived } = {}) {
         const frames = [];
         for (const part of parts) {
           const parsed = parseFrames(part + '!');
-          frames.push(...parsed);
+          // Filter frames using adaptive HV validation
+          for (const frame of parsed) {
+            if (frame.hv === null || isHvValid(frame.hv)) {
+              frames.push(frame);
+            }
+          }
         }
 
         if (frames.length === 0) return;
@@ -426,8 +528,16 @@ export function useBleDetector({ onCountReceived } = {}) {
           displayQueueRef.current.push(frame);
         }
 
-        // Start (or continue) the 1-per-second drain
-        _startDrain();
+        // RAF batching: Schedule drain with RAF only if not already scheduled.
+        // This batches frequent frame notifications while keeping sporadic
+        // ones responsive (via immediate _startDrain dispatch).
+        if (!drainScheduledRef.current) {
+          drainScheduledRef.current = true;
+          requestAnimationFrame(() => {
+            drainScheduledRef.current = false;
+            _startDrain();
+          });
+        }
       },
     );
   }
@@ -588,11 +698,16 @@ export function useBleDetector({ onCountReceived } = {}) {
    *
    * The reassembly buffer is cleared so partial data from the pre-warm period
    * cannot bleed into the first real frame.
+   *
+   * A 500ms stabilization grace period is started to discard frames that
+   * arrive during HV settling, ensuring only stable detector data is queued.
    */
   const startCollecting = useCallback(() => {
     bleBufferRef.current  = ''; // discard any pre-warm partial data
     collectingRef.current = true;
-    console.log('[BLE] startCollecting: gate OPEN — frames will now be queued');
+    // Start 500ms grace period to let HV stabilize before accepting frames
+    stabilizationEndTimeRef.current = Date.now() + 500;
+    console.log('[BLE] startCollecting: gate OPEN — frames will now be queued (after 500ms stabilization)');
   }, []);
 
   /**
@@ -604,6 +719,7 @@ export function useBleDetector({ onCountReceived } = {}) {
    */
   const stopCollecting = useCallback(() => {
     collectingRef.current = false;
+    stabilizationEndTimeRef.current = 0; // reset grace period
     console.log('[BLE] stopCollecting: gate CLOSED — incoming frames discarded');
   }, []);
 
@@ -620,6 +736,13 @@ export function useBleDetector({ onCountReceived } = {}) {
       clearInterval(displayDrainRef.current);
       displayDrainRef.current = null;
     }
+    if (rafIdRef.current) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+    drainScheduledRef.current = false;
+    stabilizationEndTimeRef.current = 0; // reset grace period
+    recentHvRef.current = []; // reset HV history for next measurement
     displayQueueRef.current = [];
     frameQueueRef.current   = [];
     console.log('[BLE] clearQueue: display and frame queues flushed');
