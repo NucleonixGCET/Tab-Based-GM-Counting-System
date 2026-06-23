@@ -37,6 +37,8 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import XLSX from 'xlsx';
 import { useBleDetector } from './hooks/useBleDetector';
+import { authenticateDevice } from './services/deviceAuthService';
+import UnauthorizedScreen from './components/UnauthorizedScreen';
 
 // Suppress known React Native internal touch-tracking warning (harmless,
 // fires when a drag gesture exits the screen bounds).
@@ -126,6 +128,43 @@ function GMProvider({ children }) {
 }
 
 export default function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [deviceId, setDeviceId] = useState(null);
+  const [authError, setAuthError] = useState(null);
+
+  useEffect(() => {
+    const checkAuth = async () => {
+      try {
+        const { authorized, deviceId: id, error } = await authenticateDevice();
+        setIsAuthenticated(authorized);
+        setDeviceId(id);
+        setAuthError(error);
+      } catch (error) {
+        console.error('Authentication error:', error);
+        setIsAuthenticated(false);
+        setAuthError(error.message);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    checkAuth();
+  }, []);
+
+  if (isLoading) {
+    return (
+      <View style={{ flex: 1, backgroundColor: '#1a1a2e', justifyContent: 'center', alignItems: 'center' }}>
+        <StatusBar barStyle="light-content" backgroundColor="#1a1a2e" />
+        <Text style={{ color: '#ffffff', fontSize: 18 }}>Verifying device...</Text>
+      </View>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return <UnauthorizedScreen deviceId={deviceId} error={authError} />;
+  }
+
   return (
     <GMProvider>
       <GMCountingScreen />
@@ -566,16 +605,18 @@ function GMCountingScreen() {
       ble.clearQueue();
 
       if (bleIsConnectedRef.current) {
-        // Wait 3 seconds (gap between iterations), then send SRTC and re-enable
-        // frame collection for the new iteration.
+        // Wait 3 seconds (gap between iterations), then re-arm collection and
+        // send SRTC.  startCollecting() is called BEFORE sendCommand so the
+        // gate is already open when the device starts streaming after SRTC.
         setTimeout(() => {
           setIterGapSnapshot(null); // clear freeze — new iteration begins
+          ble.startCollecting();    // open gate before ATT round-trip
           ble.sendCommand('SRTC!').then((ok) => {
-            if (ok) {
-              ble.startCollecting();
-              console.log('[BLE] SRTC sent — frame collection started for iteration', done + 1);
+            if (!ok) {
+              console.warn('[BLE] SRTC iteration command failed — closing gate');
+              ble.stopCollecting();
             } else {
-              console.warn('[BLE] SRTC iteration command failed');
+              console.log('[BLE] SRTC sent — collecting frames for iteration', done + 1);
             }
             setIterationRestartToken((v) => v + 1);
           });
@@ -808,17 +849,22 @@ function GMCountingScreen() {
     programSessionRef.current = null;
     setProgSub(PROG_OFF);
     setIsRunning(true);
-    // ── Send SRTC and enable frame pair-collection ──────────────────────────
-    // Always clear any stale queue/carry first, then send SRTC and immediately
-    // enable the pairing gate so only post-SRTC frames are processed.
+    // ── Send SRTC and enable frame collection ─────────────────────────────
+    // startCollecting() is called BEFORE sendCommand so the gate is open
+    // before the BLE ATT write-response round-trip (~150 ms). The firmware
+    // starts streaming immediately after receiving SRTC; opening the gate
+    // first prevents the first 1-2 frames being dropped against a closed gate.
+    // The 500 ms stabilisation grace period inside startCollecting() still
+    // discards HV-settling frames, so no spurious data enters the display queue.
     if (ble.isConnected) {
       ble.clearQueue();
+      ble.startCollecting();          // open gate NOW — before ATT round-trip
       ble.sendCommand('SRTC!').then((ok) => {
         if (!ok) {
-          console.warn('[BLE] SRTC command failed');
+          console.warn('[BLE] SRTC command failed — closing gate');
+          ble.stopCollecting();        // command failed: close gate to prevent stale frames
         } else {
-          ble.startCollecting();
-          console.log('[BLE] SRTC sent — frame collection started');
+          console.log('[BLE] SRTC sent — frame collection active');
         }
       });
     } else {

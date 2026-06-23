@@ -1,4 +1,4 @@
-# Tab-Based GM Counting System
+r# Tab-Based GM Counting System
 
 A professional, tablet-optimized radiation monitoring application designed for Nucleonix Scintillation Detectors. This system interfaces with Nordic nRF52810-based hardware via Bluetooth Low Energy (BLE) to provide real-time data acquisition, visualization, and persistent storage.
 

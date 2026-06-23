@@ -22,22 +22,22 @@
  *  BLE MTU batching may cause the two frames to arrive in a single
  *  notification, or occasionally 3-4 frames may be batched together.
  *
- *  Strategy:
+ *  Strategy (zero-delay, event-driven):
  *    1. Gate all incoming frames behind collectingRef — only frames that
  *       arrive AFTER startCollecting() (i.e. after SRTC is sent) are
- *       accepted.  This discards any HV-settling frames that the device
- *       may emit immediately after STHV, eliminating HV-spike readings.
+ *       accepted.  This discards HV-settling frames emitted between
+ *       STHV and SRTC, eliminating voltage-spike readings.
  *    2. Every accepted frame is pushed individually into a FIFO display
  *       queue (displayQueueRef).
- *    3. A drain timer releases exactly ONE frame per second from the queue,
- *       dispatching a LIVE_COUNT action each time.  This gives a perfectly
- *       steady 1-update/second LCD rate regardless of how the BLE stack
- *       batches the notifications — identical to what the Serial BT Monitor
- *       does when it prints one line per received frame.
- *    4. If more frames are in the queue than have been drained (e.g. 3
- *       frames arrived in one notification) they simply wait in the FIFO and
- *       are released in subsequent seconds — no frames are ever dropped and
- *       no artificial summing or pairing is done.
+ *    3. _startDrain() is called SYNCHRONOUSLY from the notification callback
+ *       — no requestAnimationFrame, no setInterval, no artificial delay.
+ *       It dispatches each frame immediately via _drainNext().
+ *    4. When a BLE MTU window batches multiple frames in one notification,
+ *       _drainNext() releases them sequentially via setTimeout(0).  Each
+ *       call is a separate event-loop task so React renders every frame
+ *       individually — no values are ever skipped.
+ *    5. The hardware firmware already enforces 1 Hz; the app never needs
+ *       to meter or delay a frame artificially.
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -118,8 +118,21 @@ function reducer(state, action) {
 // ── Helpers ────────────────────────────────────────────────────────
 function decodeCharValue(base64Value) {
   if (!base64Value) return '';
-  try   { return decodeBase64(base64Value); }
-  catch (e) { console.warn('[BLE] Base64 decode error:', e.message); return ''; }
+  try {
+    // react-native-ble-plx strips trailing '=' padding from characteristic
+    // base64 values before passing them to JS.  Without correct padding the
+    // base-64 polyfill (atob) silently drops the last 1–2 raw bytes of every
+    // BLE notification.  Those dropped bytes are exactly the characters that
+    // sit at a packet-boundary (',' or 's' in "Counts,N,CurHV,F!"), causing
+    // the reassembled segment to fail the frame regex and be discarded.
+    // Re-adding the padding here recovers those bytes.
+    const rem = base64Value.length % 4;
+    const padded = rem > 0 ? base64Value + '='.repeat(4 - rem) : base64Value;
+    return decodeBase64(padded);
+  } catch (e) {
+    console.warn('[BLE] Base64 decode error:', e.message);
+    return '';
+  }
 }
 
 /**
@@ -209,22 +222,41 @@ export function useBleDetector({ onCountReceived } = {}) {
 
   // ── Display queue ─────────────────────────────────────────────
   // Each element is a { count, hv } frame representing exactly 1 second of
-  // detector data.  The drain timer below releases one element per second,
-  // producing a steady 1 Hz LCD update that matches what the Serial BT
-  // Monitor shows when it prints one line per received frame.
+  // detector data.
+  //
+  // DRAIN STRATEGY — drift-free absolute-timestamp scheduler:
+  //
+  //   PROBLEM (fixed in earlier rounds):
+  //     setInterval(1000ms) drifted 10–50ms/tick → 75–80s for 60 values.
+  //     requestAnimationFrame added 200–500ms per batch on loaded Android JS.
+  //
+  //   PROBLEM (fixed now):
+  //     setTimeout(0) dispatched all burst frames within a few ms → display
+  //     jumped 0 → 3 with intermediate values invisible to the user.
+  //
+  //   SOLUTION:
+  //     First frame in each batch is dispatched synchronously (zero initial lag).
+  //     Subsequent burst frames are each scheduled at:
+  //
+  //       nextFrameTargetRef.current += 1000
+  //       delay = max(0, nextFrameTargetRef.current - Date.now())
+  //
+  //     Using an ABSOLUTE target (not setTimeout(1000)) means drift is
+  //     self-correcting: if a tick fires 20ms late, the next target is still
+  //     "target+1000", not "now+1000", so error never accumulates.
+  //
+  //     Single 1Hz frames (normal case): delay ≈ 0 — no lag, no drift.
+  //     Burst N frames: displayed at T, T+1s, T+2s … T+(N-1)s — smooth.
   const displayQueueRef = useRef([]);
-  const displayDrainRef = useRef(null);  // setInterval handle
+  const displayDrainRef = useRef(null);     // setTimeout handle (null = idle)
+  const nextFrameTargetRef = useRef(0);    // absolute ms wall-clock target for next frame
 
   // ── frameQueueRef ─────────────────────────────────────────────
   // Secondary queue used by the App.js counting loop (flushFrames / popFrame).
   const frameQueueRef = useRef([]);
 
-  // ── Throttle state updates to reduce re-renders on low-end devices ────
-  // Instead of updating state for every frame, batch updates using RAF.
-  // This prevents the main thread from being overwhelmed by React updates.
-  const pendingFrameRef = useRef(null);
-  const rafIdRef = useRef(null);
-  const drainScheduledRef = useRef(false);
+  // (RAF gate removed — _startDrain() is called directly from the
+  //  notification callback and has its own re-entrancy guard.)
 
   // ── HV stabilization grace period ────────────────────────────────────
   // When HV is changed, the device takes time to settle. During this time,
@@ -282,19 +314,15 @@ export function useBleDetector({ onCountReceived } = {}) {
     _stopDrain();
   }
 
-  /** Stop the drain timer and wipe both queues + the collecting gate. */
+  /** Stop the drain chain and wipe both queues + the collecting gate. */
   function _stopDrain() {
-    if (displayDrainRef.current) {
-      clearInterval(displayDrainRef.current);
+    if (displayDrainRef.current !== null) {
+      clearTimeout(displayDrainRef.current);
       displayDrainRef.current = null;
     }
-    if (rafIdRef.current) {
-      cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = null;
-    }
-    drainScheduledRef.current = false;
-    stabilizationEndTimeRef.current = 0; // reset grace period
-    recentHvRef.current = []; // reset HV history
+    nextFrameTargetRef.current = 0;
+    stabilizationEndTimeRef.current = 0;
+    recentHvRef.current = [];
     displayQueueRef.current = [];
     frameQueueRef.current   = [];
     collectingRef.current   = false;
@@ -338,52 +366,61 @@ export function useBleDetector({ onCountReceived } = {}) {
   }
 
   /**
-   * _startDrain()
+   * _drainNext() / _startDrain()
    *
-   * Ensures the 1-per-second drain timer is running.
+   * Drift-free absolute-timestamp display scheduler.
+   * ──────────────────────────────────────────────────
    *
-   * OPTIMIZATION STRATEGY:
-   * - For responsive behavior at LOW frame rates (sporadic arrival like at 400HV):
-   *   Dispatch the first frame IMMEDIATELY, not via RAF. This prevents lag.
-   * - For HIGH frame rates (batched notifications like at 500+HV):
-   *   RAF batching still applies to the initial _startDrain() call from the
-   *   notification handler, which prevents flooding React. But once the drain
-   *   timer is active, frames queue normally.
-   * - Subsequent frames: released one per second by the interval.
-   * - Auto-stop: when the queue becomes empty the interval clears itself.
+   * _startDrain() anchors nextFrameTargetRef to Date.now() and immediately
+   * calls _drainNext() (no RAF, no timer — synchronous).
    *
-   * Guard: if the drain is already running when new frames are pushed, nothing
-   * extra is needed — the interval will keep popping until empty.
+   * _drainNext() dispatches the head of the display queue, then:
+   *   • If the queue is now empty → chain idles (displayDrainRef = null).
+   *   • If more frames remain (burst batch) → advance the absolute target
+   *     by 1000ms and schedule the next _drainNext call at:
+   *
+   *       delay = max(0, nextFrameTarget - Date.now())
+   *
+   *     This gives smooth 1-per-second display updates for burst batches while
+   *     being self-correcting: a 20ms-late tick shifts the NEXT target by 20ms,
+   *     not the one after that.  Error never accumulates.
+   *
+   * Single 1Hz frames (normal case):
+   *   delay is always ≈ 0 because nextFrameTarget ≈ Date.now() when called.
+   *   No perceptible lag, no drift.
+   *
+   * Re-entrancy: displayDrainRef !== null prevents double-scheduling.
+   * New frames pushed by a later notification are picked up automatically
+   * when the active chain's next _drainNext fires and shifts the queue.
    */
-  function _startDrain() {
-    if (displayDrainRef.current) return; // drain interval already running
-    if (displayQueueRef.current.length === 0) return; // nothing to drain
-
-    // IMMEDIATE dispatch of first frame (no RAF delay)
-    // This ensures responsive behavior at low frame rates
-    const first = displayQueueRef.current.shift();
-    if (first) {
-      pendingFrameRef.current = first;
-      dispatch({ type: 'LIVE_COUNT', payload: first });
-      onCountReceived?.(first.count);
+  function _drainNext() {
+    const frame = displayQueueRef.current.shift();
+    if (!frame) {
+      displayDrainRef.current = null; // chain idle
+      return;
     }
 
-    if (displayQueueRef.current.length === 0) return; // nothing more to drain
+    dispatch({ type: 'LIVE_COUNT', payload: frame });
+    onCountReceived?.(frame.count);
 
-    // Set up the 1-per-second interval for subsequent frames
-    displayDrainRef.current = setInterval(() => {
-      const frame = displayQueueRef.current.shift();
-      if (frame) {
-        pendingFrameRef.current = frame;
-        dispatch({ type: 'LIVE_COUNT', payload: frame });
-        onCountReceived?.(frame.count);
-      }
-      // Auto-cancel when queue drains completely
-      if (displayQueueRef.current.length === 0) {
-        clearInterval(displayDrainRef.current);
-        displayDrainRef.current = null;
-      }
-    }, 1000);
+    if (displayQueueRef.current.length > 0) {
+      // Advance absolute target by exactly 1 second.
+      // delay = time remaining until that target (self-corrects if late).
+      nextFrameTargetRef.current += 1000;
+      const delay = Math.max(0, nextFrameTargetRef.current - Date.now());
+      displayDrainRef.current = setTimeout(_drainNext, delay);
+    } else {
+      displayDrainRef.current = null;
+    }
+  }
+
+  function _startDrain() {
+    if (displayDrainRef.current !== null) return; // chain already running
+    if (displayQueueRef.current.length === 0) return;
+    // Anchor the first frame to now — guarantees zero initial lag for
+    // single 1Hz frames and for the first frame of any burst batch.
+    nextFrameTargetRef.current = Date.now();
+    _drainNext(); // synchronous, no RAF
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -491,27 +528,72 @@ export function useBleDetector({ onCountReceived } = {}) {
           return;
         }
 
-        // ── Reassemble fragmented BLE packets ──────────────────────────────
-        // Append raw bytes to the buffer and split on '!' terminators.
-        // The tail after the last '!' (possibly empty or a partial frame)
-        // is kept in bleBufferRef for the next notification.
+        // ── Reassemble fragmented BLE packets (delimiter-based) ──────────────
+        // BLE MTU fragmentation can split the byte stream at ANY boundary.
+        // '!' is the true frame terminator; '\r\n' that follows is optional
+        // noise that may arrive in the next notification. We split on '!' alone
+        // so no frame is ever left stranded in the buffer waiting for '\r\n'.
         const raw = decodeCharValue(characteristic?.value);
         if (!raw) return; // empty notification
-        
+
+        // ── RAW DATA LOG ──────────────────────────────────────────────────────
+        console.log(`[BLE RAW] ${new Date().toISOString()} | ${JSON.stringify(raw)}`);
+
+        // ── Stream stitcher ───────────────────────────────────────────────────
+        // The device emits a continuous ASCII stream. Each frame ends with '!'
+        // (e.g. "Counts,0,CurHV,0.401!"), optionally followed by "\r\n" as an
+        // inter-frame separator. BLE MTU chunking can split the stream at ANY
+        // boundary — including between '!' and '\r\n', or mid-payload.
+        //
+        // KEY INSIGHT: '!' is the true frame terminator. The '\r\n' that may
+        // follow is noise — it might arrive in the NEXT notification. Splitting
+        // on '!\r\n' left the last frame of every burst stuck in the buffer
+        // (its '\r\n' hadn't arrived yet), causing ~1 frame loss per burst.
+        //
+        // Strategy — split on '!' alone:
+        //   1. Append new raw bytes to the persistent buffer.
+        //   2. Split on '!'. Each element BEFORE a '!' is a complete frame
+        //      payload (possibly prefixed with '\r\n' from the previous frame).
+        //   3. The element AFTER the final '!' is an incomplete tail — keep it.
+        //   4. Strip whitespace/\r\n from each segment and parse it.
+        //   5. Non-metric messages (e.g. "THV 400") are silently ignored.
+        //
+        // The buffer is flushed to '' in _stopDrain() (called on disconnect,
+        // stopCollecting, and connection reset) to prevent stale data bleeding
+        // across separate measurement runs.
+
+        // 1. Accumulate
         bleBufferRef.current += raw;
 
-        const parts = bleBufferRef.current.split('!');
-        bleBufferRef.current = parts.pop() ?? ''; // save incomplete tail
+        // Safety: bound the buffer so a protocol desync can't leak memory.
+        if (bleBufferRef.current.length > 4096) {
+          console.warn('[BLE] Buffer overflow — clearing', bleBufferRef.current.length, 'bytes');
+          bleBufferRef.current = '';
+          return;
+        }
 
-        // ── Parse each complete segment ────────────────────────────────────
+        // 2. Split on '!' — the true frame terminator.
+        const segments = bleBufferRef.current.split('!');
+
+        // 3. The last element is always an incomplete tail — keep it in the buffer.
+        bleBufferRef.current = segments.pop() ?? '';
+
+        // 4. Parse every complete segment (everything before a '!').
         const frames = [];
-        for (const part of parts) {
-          const parsed = parseFrames(part + '!');
-          // Filter frames using adaptive HV validation
-          for (const frame of parsed) {
-            if (frame.hv === null || isHvValid(frame.hv)) {
-              frames.push(frame);
-            }
+        for (const seg of segments) {
+          // Strip any leading/trailing \r\n (inter-frame separators).
+          const line = seg.trim();
+
+          // 5. Ignore non-metric system messages (e.g. "THV 400", empty strings).
+          const m = line.match(/Counts,(\d+),CurHV,([\d.]+)$/);
+          if (!m) continue;
+
+          const hvRaw   = parseFloat(m[2]);
+          const hvVolts = hvRaw >= 10 ? Math.round(hvRaw) : Math.round(hvRaw * 1000);
+
+          // Hard bounds: 0–1600 V.
+          if (hvVolts >= 0 && hvVolts <= 1600) {
+            frames.push({ count: parseInt(m[1], 10), hv: hvVolts });
           }
         }
 
@@ -519,25 +601,22 @@ export function useBleDetector({ onCountReceived } = {}) {
 
         console.log('[BLE] Frames received:', JSON.stringify(frames));
 
-        // ── Enqueue every frame individually ───────────────────────────────
-        // Each frame = 1 second of detector data, just like the Serial BT
-        // Monitor displays one line per frame.  The drain timer will release
-        // them one per second, producing a lag-free 1 Hz display update.
+        // ── FRAME COUNTING (no delays) ────────────────────────────────────
+        // Push frames to the counting queue immediately for iteration logic.
+        // This ensures iteration timings are not affected by display smoothing.
         for (const frame of frames) {
           frameQueueRef.current.push(frame);
+        }
+
+        // ── DISPLAY SMOOTHING (with delays) ──────────────────────────────
+        // Push frames to display queue with 1Hz smoothing for visual consistency.
+        // This only affects React state updates, not counting logic.
+        for (const frame of frames) {
           displayQueueRef.current.push(frame);
         }
 
-        // RAF batching: Schedule drain with RAF only if not already scheduled.
-        // This batches frequent frame notifications while keeping sporadic
-        // ones responsive (via immediate _startDrain dispatch).
-        if (!drainScheduledRef.current) {
-          drainScheduledRef.current = true;
-          requestAnimationFrame(() => {
-            drainScheduledRef.current = false;
-            _startDrain();
-          });
-        }
+        // Direct call — _startDrain() is re-entrancy-safe via displayDrainRef.
+        _startDrain();
       },
     );
   }
@@ -732,17 +811,13 @@ export function useBleDetector({ onCountReceived } = {}) {
    * whatever state the caller set it to.
    */
   const clearQueue = useCallback(() => {
-    if (displayDrainRef.current) {
-      clearInterval(displayDrainRef.current);
+    if (displayDrainRef.current !== null) {
+      clearTimeout(displayDrainRef.current);
       displayDrainRef.current = null;
     }
-    if (rafIdRef.current) {
-      cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = null;
-    }
-    drainScheduledRef.current = false;
-    stabilizationEndTimeRef.current = 0; // reset grace period
-    recentHvRef.current = []; // reset HV history for next measurement
+    nextFrameTargetRef.current = 0;
+    stabilizationEndTimeRef.current = 0;
+    recentHvRef.current = [];
     displayQueueRef.current = [];
     frameQueueRef.current   = [];
     console.log('[BLE] clearQueue: display and frame queues flushed');
